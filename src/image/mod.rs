@@ -86,6 +86,17 @@ impl ImageServiceImpl {
         }
         Ok(())
      }
+
+     // 保存镜像元数据
+     async fn save_image_metadata(&self, image: &Image) -> Result<()> {
+        let meta_path = self.storage_path.join("images").join(&image.id).join("metadata.json");
+        if !meta_path.exists() {
+            std::fs::create_dir_all(meta_path.parent().unwrap()).context("Failed to create metadata directory")?;
+        }
+        let meta_data = serde_json::to_vec(image).context("Failed to serialize metadata")?;
+        std::fs::write(meta_path, meta_data).context("Failed to write metadata")?;
+        Ok(())
+     }
 }
 
 #[tonic::async_trait]
@@ -140,20 +151,66 @@ impl ImageService for ImageServiceImpl {
         request: Request<PullImageRequest>,
     ) -> Result<Response<PullImageResponse>, Status> {
         let req = request.into_inner();
-        let image_spec = req.image.unwrap();
-        let image_id = format!("sha256:{}", uuid::Uuid::new_v4());
+        let image_spec = req.image.ok_or_else(|| Status::invalid_argument("Image spec not specified"))?;
+
+        let auth = req.auth.map(|a| RegistryAuth::Basic(
+            a.username, 
+            a.password
+        )).unwrap_or(RegistryAuth::Anonymous);
+
+        // 解析镜像引用
+        let reference: Reference = image_spec.image.parse().map_err(|e| {
+            Status::invalid_argument(format!("Invalid image reference: {}", e))
+        })?;
+
+        info!("Pulling image: {}", image_spec.image);
+
+        // 拉取镜像
+        let (image_data, _) = self.oci_client
+            .pull(&reference, &auth, vec!["application/vnd.oci.image.manifest.v1+json"])
+            .await
+            .map_err(|e| {
+                error!("Failed to pull image: {}", e);
+                Status::internal(format!("Failed to pull image: {}", e))
+            })?;
         
-        let mut images = self.images.lock().await;
-        let image = Image {
+        // 生成镜像ID
+        let image_id = format!("sha256:{}", &image_data.config.digest.replace("sha256:", "")[..12]);
+
+        let image = CriusImage {
             id: image_id.clone(),
             repo_tags: vec![image_spec.image.clone()],
             size: 0,
             // 填充其他字段...
             ..Default::default()
         };
+
+        // 创建镜像存储位置
+        let image_dir = self.storage_path.join("images").join(&image_id);
+        std::fs::create_dir_all(&image_dir).context("Failed to create image directory")?;
         
+        // 保存镜像层
+        for (i, layer) in image_data.layers.iter().enumerate() {
+            let layer_path = image_dir.join(format!("{}.tar.gz", i));
+            std::fs::write(&layer_path, layer.data).context("Failed to write layer")?;
+        }
+
+        // 保存镜像配置
+        let config_path = image_dir.join("config.json");
+        std::fs::write(&config_path, serde_json::to_vec(&image_data.config).context("Failed to write config")?).context("Failed to write config")?;
+        
+        // 保存镜像元数据
+        self.save_image_metadata(&image).await.map_err(|e| {
+            error!("Failed to save image metadata: {}", e);
+            Status::internal(format!("Failed to save image metadata: {}", e))
+        })?;
+        
+        // 更新内存中镜像数据
+        let mut images = self.images.lock().await;
         images.insert(image_spec.image, image);
         
+        info!("Image {} pulled successfully", image);
+
         Ok(Response::new(PullImageResponse {
             image_ref: image_id,
         }))

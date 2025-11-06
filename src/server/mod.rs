@@ -47,7 +47,7 @@ impl RuntimeService for RuntimeServiceImpl {
     ) -> Result<Response<VersionResponse>, Status> {
         Ok(Response::new(VersionResponse {
             version: "0.1.0".to_string(),
-            runtime_name: "crius-rs".to_string(),
+            runtime_name: "crius".to_string(),
             runtime_version: "0.1.0".to_string(),
             runtime_api_version: "v1alpha2".to_string(),
         }))
