@@ -7,7 +7,7 @@ use oci_distribution::{
 };
 use std::path::PathBuf;
 
-use crate::proto::runtime::v1alpha2::{
+use crate::proto::runtime::v1::{
     image_service_server::ImageService, Image, ImageStatusRequest, ImageStatusResponse,
     ListImagesResponse, PullImageRequest, PullImageResponse, RemoveImageRequest,
     RemoveImageResponse,

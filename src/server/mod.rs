@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
-use crate::proto::runtime::v1alpha2::{
+use crate::proto::runtime::v1::{
     runtime_service_server::RuntimeService, Container, ContainerState, ContainerStatus,
     ContainerStatusResponse, ExecResponse, ExecSyncResponse, ListContainersResponse,
     ListPodSandboxResponse, PortForwardResponse, RunPodSandboxRequest, RunPodSandboxResponse,
@@ -49,7 +49,7 @@ impl RuntimeService for RuntimeServiceImpl {
             version: "0.1.0".to_string(),
             runtime_name: "crius".to_string(),
             runtime_version: "0.1.0".to_string(),
-            runtime_api_version: "v1alpha2".to_string(),
+            runtime_api_version: "v1".to_string(),
         }))
     }
 

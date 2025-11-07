@@ -52,7 +52,10 @@ async fn main() -> Result<()> {
 
     // 创建服务实例
     let runtime_service = RuntimeServiceImpl::new(runtime_config);
-    let image_service = ImageServiceImpl::new();
+    let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
+
+    // 加载本地镜像
+    image_service.load_local_images().await?;
 
     // 创建gRPC服务器
     let addr: SocketAddr = args.listen.parse()?;
@@ -63,12 +66,12 @@ async fn main() -> Result<()> {
     // 启动CRI服务
     Server::builder()
         .add_service(
-            crate::proto::runtime::v1alpha2::runtime_service_server::RuntimeServiceServer::new(
+            crate::proto::runtime::v1::runtime_service_server::RuntimeServiceServer::new(
                 runtime_service,
             ),
         )
         .add_service(
-            crate::proto::runtime::v1alpha2::image_service_server::ImageServiceServer::new(
+            crate::proto::runtime::v1::image_service_server::ImageServiceServer::new(
                 image_service,
             ),
         )

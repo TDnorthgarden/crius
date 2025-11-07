@@ -4,7 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .out_dir("src/proto")
         .compile(
-            &["proto/k8s.io/cri-api/pkg/apis/runtime/v1alpha2/api.proto"],
+            &["proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto"],
             &["proto"],
         )?;
     Ok(())
