@@ -2,6 +2,8 @@ use std::fmt;
 use std::io;
 use std::process::ExitStatus;
 
+use thiserror::Error;
+
 /// 网络模块错误类型
 #[derive(Debug, Error)]
 pub enum NetworkError {

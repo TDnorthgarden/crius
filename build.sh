@@ -10,7 +10,7 @@ protoc \
     --grpc_out=src/proto \
     --plugin=protoc-gen-grpc=`which grpc_rust_plugin` \
     -I proto \
-    proto/k8s.io/cri-api/pkg/apis/runtime/v1alpha2/api.proto
+    proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto
 
 # Format the generated code
 cargo fmt --all

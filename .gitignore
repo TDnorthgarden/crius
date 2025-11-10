@@ -11,9 +11,13 @@
 # 编辑器临时文件
 .idea/
 .vscode/
+.cargo/
 *.swp
 *.swo
 
 # 本地配置文件
 /.env
 *.local
+
+# 编译依赖文件
+/vendor/

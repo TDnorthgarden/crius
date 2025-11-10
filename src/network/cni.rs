@@ -1,6 +1,8 @@
 use super::*;
 use std::path::PathBuf;
 
+use crate::error::Error;
+
 /// CNI 插件管理器
 #[derive(Debug)]
 pub struct CniManager {
@@ -23,7 +25,7 @@ impl CniManager {
         plugin_dirs: Vec<String>,
         config_dirs: Vec<String>,
         cache_dir: String,
-    ) -> Result<Self> {
+    ) -> Result<Self, Error> {
         Ok(Self {
             plugin_dirs: plugin_dirs.into_iter().map(PathBuf::from).collect(),
             config_dirs: config_dirs.into_iter().map(PathBuf::from).collect(),
@@ -33,7 +35,7 @@ impl CniManager {
     }
 
     /// 加载网络配置
-    pub async fn load_network_configs(&mut self) -> Result<()> {
+    pub async fn load_network_configs(&mut self) -> Result<(), Error> {
         // 实现加载 CNI 配置文件的逻辑
         // 从 config_dirs 中读取 .conflist 和 .conf 文件
         // 解析并存储到 network_configs 中
@@ -47,7 +49,7 @@ impl CniManager {
         pod_id: &str,
         pod_name: &str,
         pod_namespace: &str,
-    ) -> Result<NetworkStatus> {
+    ) -> Result<NetworkStatus, Error> {
         // 实现调用 CNI 插件设置网络的逻辑
         // 1. 准备 CNI 参数
         // 2. 调用 CNI 插件
@@ -60,7 +62,7 @@ impl CniManager {
         &self,
         netns: &str,
         pod_id: &str,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // 实现调用 CNI 插件清理网络的逻辑
         Ok(())
     }

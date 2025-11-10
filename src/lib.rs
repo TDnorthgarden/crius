@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod utils;
+pub mod proto;
 
 /// 预导入常用模块
 pub mod prelude {

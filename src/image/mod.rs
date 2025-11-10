@@ -1,25 +1,41 @@
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::io;
+use std::sync::Arc;
+
+use anyhow::Context;
 use tonic::{Request, Response, Status};
 use oci_distribution::{
     client::{ClientConfig, Client, ImageData},
     secrets::RegistryAuth,
     Reference,
 };
-use std::path::PathBuf;
+use log::{info, error};
+use serde::{Serialize, Deserialize};
+use tokio::sync::Mutex;
 
+use crate::error::Error;
 use crate::proto::runtime::v1::{
-    image_service_server::ImageService, Image, ImageStatusRequest, ImageStatusResponse,
-    ListImagesResponse, PullImageRequest, PullImageResponse, RemoveImageRequest,
+    image_service_server::ImageService, Image, ImageStatusRequest, ImageStatusResponse,ListImagesRequest,
+    ListImagesResponse, PullImageRequest, PullImageResponse, RemoveImageRequest,ImageFsInfoRequest,ImageFsInfoResponse,
     RemoveImageResponse,
 };
 
+/// crius镜像
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriusImage {
+    pub id: String,
+    pub repo_tags: Vec<String>,
+    pub size: u64,
+}
+
 /// 镜像服务实现
-#[derive(Debug)]
 pub struct ImageServiceImpl {
     // 存储镜像信息的线程安全HashMap
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
     storage_path: PathBuf,
-    oci_client: oci_distribution::Client,
+    oci_client: Arc<Mutex<oci_distribution::Client>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,14 +46,14 @@ pub struct ImageMeta {
 }
 
 impl ImageServiceImpl {
-    pub fn new(storage_path: impl AsRef<Path>) ->  Result<Self> {
+    pub fn new(storage_path: impl AsRef<Path>) ->  Result<Self, Error> {
         let storage_path = storage_path.as_ref().to_path_buf();
 
         if !storage_path.exists() {
             std::fs::create_dir_all(&storage_path).context("Failed to create storage directory")?;
         }
 
-        let client_config = oci_distribution::ClientConfig {
+        let client_config = oci_distribution::client::ClientConfig {
             protocol: oci_distribution::client::ClientProtocol::Https,
             ..Default::default()
         };
@@ -47,12 +63,12 @@ impl ImageServiceImpl {
         Ok(Self {
             images,
             storage_path,
-            oci_client,
+            oci_client: Arc::new(Mutex::new(oci_client)),
         })
     }
 
     // 加载本地镜像
-     async fn load_local_images(&self) -> Result<()> {
+     pub async fn load_local_images(&self) -> Result<(()), Error> {
         let imaages_dir = self.storage_path.join("images");
         if !imaages_dir.exists() {
             return Ok(());
@@ -73,13 +89,13 @@ impl ImageServiceImpl {
             let path = entry.path();
             if path.is_file() {
                 let image = Image {
-                    id: meta.id,
-                    repo_tags: meta.repo_tags,
-                    size: meta.size,
+                    id: meta.id.clone(),
+                    repo_tags: meta.repo_tags.clone(),
+                    size: meta.size.clone(),
                     // 待填充其他字段...
                     ..Default::default()
                 };
-                for tag in meta.repo_tags {
+                for tag in &meta.repo_tags {
                     images.insert(tag.clone(), image.clone());
                 }
             }
@@ -88,7 +104,7 @@ impl ImageServiceImpl {
      }
 
      // 保存镜像元数据
-     async fn save_image_metadata(&self, image: &Image) -> Result<()> {
+     async fn save_image_metadata(&self, image: &CriusImage) -> Result<(), Error> {
         let meta_path = self.storage_path.join("images").join(&image.id).join("metadata.json");
         if !meta_path.exists() {
             std::fs::create_dir_all(meta_path.parent().unwrap()).context("Failed to create metadata directory")?;
@@ -104,7 +120,7 @@ impl ImageService for ImageServiceImpl {
     // 列出镜像
     async fn list_images(
         &self,
-        _request: Request<()>,
+        _request: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
         let images = self.images.lock().await;
         let images_list = images.values().cloned().collect();
@@ -126,16 +142,16 @@ impl ImageService for ImageServiceImpl {
         
         // 尝试通过完整引用查找镜像
         if let Some(image) = images.get(&image_spec.image) {
-            Ok(Response::new(ImageStatusResponse {
+            return Ok(Response::new(ImageStatusResponse {
                 image: Some(image.clone()),
                 info: HashMap::new(),
-            }))
+            }));
         }
 
         // 尝试通过ID查找
         for image in images.values() {
             if image.id.starts_with(&image_spec.image) {
-                Ok(Response::new(ImageStatusResponse {
+                return Ok(Response::new(ImageStatusResponse {
                     image: Some(image.clone()),
                     info: HashMap::new(),
                 }));
@@ -166,18 +182,23 @@ impl ImageService for ImageServiceImpl {
         info!("Pulling image: {}", image_spec.image);
 
         // 拉取镜像
-        let (image_data, _) = self.oci_client
-            .pull(&reference, &auth, vec!["application/vnd.oci.image.manifest.v1+json"])
-            .await
-            .map_err(|e| {
-                error!("Failed to pull image: {}", e);
-                Status::internal(format!("Failed to pull image: {}", e))
-            })?;
+        let mut client = self.oci_client.lock().await;
+        let image_data = client
+        .pull(
+            &reference,
+            &oci_distribution::secrets::RegistryAuth::Anonymous,
+            vec!["application/vnd.oci.image.manifest.v1+json"],
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to pull image {}: {}", reference, e);
+            Status::internal(format!("Failed to pull image: {}", e))
+        })?;
         
         // 生成镜像ID
-        let image_id = format!("sha256:{}", &image_data.config.digest.replace("sha256:", "")[..12]);
+        let image_id = format!("sha256:{}", &image_data.digest.expect("Digest should be present").replace("sha256:", "")[..12]);
 
-        let image = CriusImage {
+        let image = Image {
             id: image_id.clone(),
             repo_tags: vec![image_spec.image.clone()],
             size: 0,
@@ -187,20 +208,34 @@ impl ImageService for ImageServiceImpl {
 
         // 创建镜像存储位置
         let image_dir = self.storage_path.join("images").join(&image_id);
-        std::fs::create_dir_all(&image_dir).context("Failed to create image directory")?;
+        std::fs::create_dir_all(&image_dir)
+            .map_err(|e: io::Error| {
+                error!("Failed to create image directory: {}", e);
+                tonic::Status::internal(format!("Failed to create image directory: {}", e))
+            })?;
         
         // 保存镜像层
         for (i, layer) in image_data.layers.iter().enumerate() {
             let layer_path = image_dir.join(format!("{}.tar.gz", i));
-            std::fs::write(&layer_path, layer.data).context("Failed to write layer")?;
+            std::fs::write(&layer_path, &layer.data)
+            .map_err(|e: io::Error| {
+                error!("Failed to write layer: {}", e);
+                tonic::Status::internal(format!("Failed to write layer: {}", e))
+            })?;
         }
 
         // 保存镜像配置
-        let config_path = image_dir.join("config.json");
-        std::fs::write(&config_path, serde_json::to_vec(&image_data.config).context("Failed to write config")?).context("Failed to write config")?;
+        // let config_path = image_dir.join("config.json");
+        // std::fs::write(&config_path, serde_json::to_vec(&image_data).context("Failed to write config")?).context("Failed to write config")?;
         
         // 保存镜像元数据
-        self.save_image_metadata(&image).await.map_err(|e| {
+        self.save_image_metadata(&CriusImage {
+            id: image_id.clone(),
+            repo_tags: vec![image_spec.image.clone()],
+            size: 0,
+            // 填充其他字段...
+            // ..Default::default()
+        }).await.map_err(|e| {
             error!("Failed to save image metadata: {}", e);
             Status::internal(format!("Failed to save image metadata: {}", e))
         })?;
@@ -209,7 +244,7 @@ impl ImageService for ImageServiceImpl {
         let mut images = self.images.lock().await;
         images.insert(image_spec.image, image);
         
-        info!("Image {} pulled successfully", image);
+        info!("Image {} pulled successfully", image_id);
 
         Ok(Response::new(PullImageResponse {
             image_ref: image_id,
@@ -229,5 +264,13 @@ impl ImageService for ImageServiceImpl {
         } else {
             Err(Status::not_found("Image not found"))
         }
+    }
+
+    // 获取镜像文件信息
+    async fn image_fs_info(
+        &self,
+        request: Request<ImageFsInfoRequest>,
+    ) -> Result<Response<ImageFsInfoResponse>, Status> {
+        Err(Status::not_found("Image not found"))
     }
 }

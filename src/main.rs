@@ -1,17 +1,19 @@
-use clap::Parser;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::net::SocketAddr;
 
 use clap::Parser;
 use tonic::transport::Server;
 use tracing_subscriber::{fmt, EnvFilter};
+use tracing::{debug, info};
+use anyhow::Error;
 
 use crate::server::{RuntimeConfig, RuntimeServiceImpl};
 use crate::image::ImageServiceImpl;
 
 mod server;
 mod image;
+mod proto;
+mod error;
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
@@ -35,7 +37,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Error> {
     // 初始化日志
     init_logging()?;
     
@@ -44,14 +46,14 @@ async fn main() -> Result<()> {
     
     // 创建运行时配置
     let runtime_config = RuntimeConfig {
-        root_dir: pathbuf::from("/var/lib/crius"),
+        root_dir: PathBuf::from("/var/lib/crius"),
         runtime: "runc".to_string(),
-        runtime_root: pathbuf::from("/var/run/runc"),
-        log_dir: pathbuf::from("/var/log/crius"),
+        runtime_root: PathBuf::from("/var/run/runc"),
+        log_dir: PathBuf::from("/var/log/crius"),
     };
 
     // 创建服务实例
-    let runtime_service = RuntimeServiceImpl::new(runtime_config);
+    let runtime_service = RuntimeServiceImpl::new(runtime_config.clone());
     let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
 
     // 加载本地镜像
@@ -81,14 +83,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_logging() -> Result<()> {
+fn init_logging() -> Result<(), Error> {
        
     let filter = EnvFilter::from_default_env()
         .add_directive("crius=info".parse()?)
         .add_directive("tower_http=info".parse()?);
     
     fmt()
-        .with_env_filter(filter)
+        .with_file(true)
+        .with_line_number(true)
         .with_writer(std::io::stderr)
         .init();
     

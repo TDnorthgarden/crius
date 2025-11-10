@@ -2,13 +2,43 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use uuid::Uuid;
 
 use crate::proto::runtime::v1::{
     runtime_service_server::RuntimeService, Container, ContainerState, ContainerStatus,
-    ContainerStatusResponse, ExecResponse, ExecSyncResponse, ListContainersResponse,
-    ListPodSandboxResponse, PortForwardResponse, RunPodSandboxRequest, RunPodSandboxResponse,
-    StatusResponse, VersionResponse,
+    ExecResponse, ExecSyncResponse,
+    PortForwardResponse, RunPodSandboxRequest, RunPodSandboxResponse,
+    StatusResponse, VersionRequest, VersionResponse,StopPodSandboxRequest,StopPodSandboxResponse,
+    ExecRequest,
+    ExecSyncRequest,PortForwardRequest,
+    StatusRequest,
+};
+use crate::proto::runtime::v1::{
+    RemovePodSandboxRequest,RemovePodSandboxResponse,
+    GetEventsRequest,ContainerEventResponse,
+    ListMetricDescriptorsRequest,ListMetricDescriptorsResponse,
+    ListPodSandboxMetricsRequest,ListPodSandboxMetricsResponse,
+    RuntimeConfigRequest,RuntimeConfigResponse,
+    CheckpointContainerRequest,CheckpointContainerResponse,
+    PodSandboxStatusRequest,PodSandboxStatusResponse,
+    ListPodSandboxRequest,ListPodSandboxResponse,
+    CreateContainerRequest,CreateContainerResponse,
+    StartContainerRequest,StartContainerResponse,
+    StopContainerRequest,StopContainerResponse,
+    RemoveContainerRequest,RemoveContainerResponse,
+    ListContainersRequest,ListContainersResponse,
+    ContainerStatusRequest,ContainerStatusResponse,
+    ReopenContainerLogRequest,ReopenContainerLogResponse,
+    AttachRequest,AttachResponse,
+    ContainerStatsRequest,ContainerStatsResponse,
+    ListContainerStatsRequest,ListContainerStatsResponse,
+    PodSandboxStatsRequest,PodSandboxStatsResponse,
+    ListPodSandboxStatsRequest,ListPodSandboxStatsResponse,
+    UpdateRuntimeConfigRequest,UpdateRuntimeConfigResponse,
+    UpdateContainerResourcesRequest,UpdateContainerResourcesResponse,
+    PodSandboxState,PodSandboxStatus,
 };
 
 /// 运行时服务实现
@@ -43,7 +73,7 @@ impl RuntimeService for RuntimeServiceImpl {
     // 获取运行时版本
     async fn version(
         &self,
-        _request: Request<()>,
+        _request: Request<VersionRequest>,
     ) -> Result<Response<VersionResponse>, Status> {
         Ok(Response::new(VersionResponse {
             version: "0.1.0".to_string(),
@@ -75,24 +105,25 @@ impl RuntimeService for RuntimeServiceImpl {
     // 停止Pod沙箱
     async fn stop_pod_sandbox(
         &self,
-        _request: Request<String>,
-    ) -> Result<Response<()>, Status> {
+        _request: Request<StopPodSandboxRequest>,
+    ) -> Result<Response<StopPodSandboxResponse>, Status> {
         // 实现停止Pod沙箱的逻辑
-        Ok(Response::new(()))
+        Ok(Response::new(StopPodSandboxResponse { }))
     }
 
     // 获取容器状态
     async fn container_status(
         &self,
-        request: Request<String>,
+        request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
-        let container_id = request.into_inner();
+        let req = request.into_inner();
+        let container_id = req.container_id;
         let containers = self.containers.lock().await;
         
         if let Some(container) = containers.get(&container_id) {
             let status = ContainerStatus {
                 id: container.id.clone(),
-                state: ContainerState::Running as i32,
+                state: ContainerState::ContainerRunning as i32,
                 // 填充其他状态字段...
                 ..Default::default()
             };
@@ -109,7 +140,7 @@ impl RuntimeService for RuntimeServiceImpl {
     // 列出容器
     async fn list_containers(
         &self,
-        _request: Request<()>,
+        _request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
         let containers = self.containers.lock().await;
         let containers_list = containers.values().cloned().collect();
@@ -122,7 +153,7 @@ impl RuntimeService for RuntimeServiceImpl {
     // 执行命令
     async fn exec(
         &self,
-        _request: Request<()>,
+        _request: Request<ExecRequest>,
     ) -> Result<Response<ExecResponse>, Status> {
         // 实现执行命令的逻辑
         Ok(Response::new(ExecResponse {
@@ -133,7 +164,7 @@ impl RuntimeService for RuntimeServiceImpl {
     // 同步执行命令
     async fn exec_sync(
         &self,
-        _request: Request<()>,
+        _request: Request<ExecSyncRequest>,
     ) -> Result<Response<ExecSyncResponse>, Status> {
         // 实现同步执行命令的逻辑
         Ok(Response::new(ExecSyncResponse {
@@ -146,7 +177,7 @@ impl RuntimeService for RuntimeServiceImpl {
     // 端口转发
     async fn port_forward(
         &self,
-        _request: Request<()>,
+        _request: Request<PortForwardRequest>,
     ) -> Result<Response<PortForwardResponse>, Status> {
         // 实现端口转发的逻辑
         Ok(Response::new(PortForwardResponse {
@@ -157,12 +188,223 @@ impl RuntimeService for RuntimeServiceImpl {
     // 获取运行时状态
     async fn status(
         &self,
-        _request: Request<()>,
+        _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         // 实现获取运行时状态的逻辑
         Ok(Response::new(StatusResponse {
             status: None,
             info: HashMap::new(),
         }))
+    }
+
+    // 删除pod_sandbox
+    async fn remove_pod_sandbox(
+        &self,
+        _request: Request<RemovePodSandboxRequest>,
+    ) -> Result<Response<RemovePodSandboxResponse>, Status> {
+        // 实现删除Pod沙箱的逻辑
+        Ok(Response::new(RemovePodSandboxResponse { }))
+    }
+
+    // 获取pod_sandbox状态
+    async fn pod_sandbox_status(
+        &self,
+        _request: Request<PodSandboxStatusRequest>,
+    ) -> Result<Response<PodSandboxStatusResponse>, Status> {
+        // 实现获取Pod沙箱状态的逻辑
+        Ok(Response::new(PodSandboxStatusResponse {
+            info: HashMap::new(),
+            status: None,
+            containers_statuses: Vec::new(),
+            timestamp: 0,
+            // 填充其他状态字段...
+            //..Default::default()
+        }))
+    }
+
+    // 列出pod_sandbox
+    async fn list_pod_sandbox(
+        &self,
+        _request: Request<ListPodSandboxRequest>,
+    ) -> Result<Response<ListPodSandboxResponse>, Status> {
+        // 实现列出Pod沙箱的逻辑
+        Ok(Response::new(ListPodSandboxResponse {
+            items: Vec::new(),
+        }))
+    }
+
+    // 创建容器
+    async fn create_container(
+        &self,
+        _request: Request<CreateContainerRequest>,
+    ) -> Result<Response<CreateContainerResponse>, Status> {
+        // 实现创建容器的逻辑
+        Ok(Response::new(CreateContainerResponse {
+            container_id: "".to_string(),
+        }))
+    }
+
+    // 启动容器
+    async fn start_container(
+        &self,
+        _request: Request<StartContainerRequest>,
+    ) -> Result<Response<StartContainerResponse>, Status> {
+        // 实现启动容器的逻辑
+        Ok(Response::new(StartContainerResponse { }))
+    }
+
+    // 停止容器
+    async fn stop_container(
+        &self,
+        _request: Request<StopContainerRequest>,
+    ) -> Result<Response<StopContainerResponse>, Status> {
+        // 实现停止容器的逻辑
+        Ok(Response::new(StopContainerResponse { }))
+    }
+
+    // 删除容器
+    async fn remove_container(
+        &self,
+        _request: Request<RemoveContainerRequest>,
+    ) -> Result<Response<RemoveContainerResponse>, Status> {
+        // 实现删除容器的逻辑
+        Ok(Response::new(RemoveContainerResponse { }))
+    }
+
+    //重新打开容器日志
+    async fn reopen_container_log(
+        &self,
+        _request: Request<ReopenContainerLogRequest>,
+    ) -> Result<Response<ReopenContainerLogResponse>, Status> {
+        // 实现重新打开容器日志的逻辑
+        Ok(Response::new(ReopenContainerLogResponse { }))
+    }
+
+    //
+    async fn attach(
+        &self,
+        _request: Request<AttachRequest>,
+    ) -> Result<Response<AttachResponse>, Status> {
+        // 实现 attach 的逻辑
+        Ok(Response::new(AttachResponse {
+            url: "unix:///var/run/crius/crius.sock".to_string(),
+        }))
+    }
+
+    // 容器统计信息
+    async fn container_stats(
+        &self,
+        _request: Request<ContainerStatsRequest>,
+    ) -> Result<Response<ContainerStatsResponse>, Status> {
+        // 实现 container_stats 的逻辑
+        Ok(Response::new(ContainerStatsResponse {
+            stats: None,
+        }))
+    }
+
+    // 容器列表统计信息
+    async fn list_container_stats(
+        &self,
+        _request: Request<ListContainerStatsRequest>,
+    ) -> Result<Response<ListContainerStatsResponse>, Status> {
+        // 实现 list_container_stats 的逻辑
+        Ok(Response::new(ListContainerStatsResponse {
+            stats: Vec::new(),
+        }))
+    }
+
+    // pod沙箱统计信息
+    async fn pod_sandbox_stats(
+        &self,
+        _request: Request<PodSandboxStatsRequest>,
+    ) -> Result<Response<PodSandboxStatsResponse>, Status> {
+        // 实现 pod_sandbox_stats 的逻辑
+        Ok(Response::new(PodSandboxStatsResponse {
+            stats: None,
+        }))
+    }
+
+    // pod沙箱列表统计信息
+    async fn list_pod_sandbox_stats(
+        &self,
+        _request: Request<ListPodSandboxStatsRequest>,
+    ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
+        // 实现 list_pod_sandbox_stats 的逻辑
+        Ok(Response::new(ListPodSandboxStatsResponse {
+            stats: Vec::new(),
+        }))
+    }
+
+    // 更新运行时配置
+    async fn update_runtime_config(
+        &self,
+        _request: Request<UpdateRuntimeConfigRequest>,
+    ) -> Result<Response<UpdateRuntimeConfigResponse>, Status> {
+        // 实现 update_runtime_config 的逻辑
+        Ok(Response::new(UpdateRuntimeConfigResponse { }))
+    }
+
+    //
+    async fn checkpoint_container(
+        &self,
+        _request: Request<CheckpointContainerRequest>,
+    ) -> Result<Response<CheckpointContainerResponse>, Status> {
+        // 实现 checkpoint_container 的逻辑
+        Ok(Response::new(CheckpointContainerResponse { }))
+    }
+
+    type GetContainerEventsStream = ReceiverStream<Result<ContainerEventResponse, Status>>;
+
+    //
+    async fn get_container_events(
+        &self,
+        _request: Request<GetEventsRequest>,
+    ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
+        // 实现 get_container_events 的逻辑
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let stream = ReceiverStream::new(rx);
+        Ok(Response::new(stream))
+    }
+
+    //
+    async fn list_metric_descriptors(
+        &self,
+        _request: Request<ListMetricDescriptorsRequest>,
+    ) -> Result<Response<ListMetricDescriptorsResponse>, Status> {
+        // 实现 list_metric_descriptors 的逻辑
+        Ok(Response::new(ListMetricDescriptorsResponse {
+            descriptors: Vec::new(),
+        }))
+    }
+
+    //
+    async fn list_pod_sandbox_metrics(
+        &self,
+        _request: Request<ListPodSandboxMetricsRequest>,
+    ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
+        // 实现 list_pod_sandbox_metrics 的逻辑
+        Ok(Response::new(ListPodSandboxMetricsResponse {
+            pod_metrics: Vec::new(),
+        }))
+    }
+
+    //
+    async fn runtime_config(
+        &self,
+        _request: Request<RuntimeConfigRequest>,
+    ) -> Result<Response<RuntimeConfigResponse>, Status> {
+        // 实现 runtime_config 的逻辑
+        Ok(Response::new(RuntimeConfigResponse {
+            linux: None,
+            
+        }))
+    }
+
+    async fn update_container_resources(
+        &self,
+        _request: Request<UpdateContainerResourcesRequest>,
+    ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
+        // TODO: 实现资源更新逻辑
+        Ok(Response::new(UpdateContainerResourcesResponse { }))
     }
 }
