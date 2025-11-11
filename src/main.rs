@@ -1,14 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
+use std::os::unix::net::UnixListener;
+use std::fs;
 
+use tokio::net::UnixListener as TokioUnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
 use clap::Parser;
 use tonic::transport::Server;
+use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing_subscriber::{fmt, EnvFilter};
 use tracing::{debug, info};
 use anyhow::Error;
 
 use crate::server::{RuntimeConfig, RuntimeServiceImpl};
 use crate::image::ImageServiceImpl;
+use crate::proto::runtime::v1::{
+    runtime_service_server::RuntimeServiceServer,
+    image_service_server::ImageServiceServer,
+};
 
 mod server;
 mod image;
@@ -31,8 +40,8 @@ struct Args {
     #[clap(short, long)]
     log: Option<PathBuf>,
 
-    /// Listen address
-    #[clap(long, default_value = "0.0.0.0:10000")]
+    /// Listen address (IP:port or unix://path/to/socket)
+    #[clap(long, default_value = "unix:///run/crius/crius.sock")]
     listen: String,
 }
 
@@ -55,30 +64,45 @@ async fn main() -> Result<(), Error> {
     // 创建服务实例
     let runtime_service = RuntimeServiceImpl::new(runtime_config.clone());
     let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin")))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create reflection service: {}", e))?;
 
     // 加载本地镜像
     image_service.load_local_images().await?;
 
     // 创建gRPC服务器
-    let addr: SocketAddr = args.listen.parse()?;
-    
-    info!("Starting crius gRPC server on {}", addr);
+    info!("Starting crius gRPC server on {}", args.listen);
     debug!("Using configuration: {:?}", runtime_config);
     
-    // 启动CRI服务
-    Server::builder()
-        .add_service(
-            crate::proto::runtime::v1::runtime_service_server::RuntimeServiceServer::new(
-                runtime_service,
-            ),
-        )
-        .add_service(
-            crate::proto::runtime::v1::image_service_server::ImageServiceServer::new(
-                image_service,
-            ),
-        )
-        .serve(addr)
-        .await?;
+    let server = Server::builder()
+        .add_service(RuntimeServiceServer::new(runtime_service))
+        .add_service(ImageServiceServer::new(image_service))
+        .add_service(reflection_service);
+
+    if args.listen.starts_with("unix://") {
+        // Unix domain socket
+        let socket_path = args.listen.trim_start_matches("unix://");
+        let path = Path::new(socket_path);
+        
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        // 清理旧socket文件
+        let _ = fs::remove_file(path);
+        
+        // 创建Unix监听器
+        let uds = UnixListener::bind(path)?;
+        let uds_stream = UnixListenerStream::new(TokioUnixListener::from_std(uds)?);
+        
+        // 启动服务
+        server.serve_with_incoming(uds_stream).await?;
+    } else {
+        let addr: SocketAddr = args.listen.parse()?;
+        server.serve(addr).await?;
+    }
     
     Ok(())
 }
