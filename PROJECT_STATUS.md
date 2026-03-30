@@ -11,7 +11,7 @@
 
 ## 🎯 功能实现程度
 
-### ✅ 已完成功能 (约85%)
+### ✅ 已完成功能 (约92%)
 
 #### 🔧 核心运行时集成
 - [x] **RuncRuntime接口定义** - Trait和结构体定义完成
@@ -31,6 +31,8 @@
 - [x] **CNI多网络** - 多网卡支持，网络选择器，多网络配置
 - [x] **安全功能** - SELinux/AppArmor/Seccomp支持
 - [x] **CRI接口完善** - 统计信息、资源更新、运行时配置
+- [x] **存储卷管理** - Bind mount/tmpfs/emptyDir/hostPath卷支持
+- [x] **Rootless模式** - UID/GID映射，用户命名空间，无特权容器运行
 
 #### 🌐 CRI接口实现
 - [x] **RuntimeService框架** - gRPC服务结构和方法定义
@@ -96,9 +98,9 @@
 - [x] **资源限制** - CPU/内存/IO限制 (cgroups)
 - [x] **安全功能** - SELinux/AppArmor/Seccomp支持
 - [x] **端口映射** - iptables/nftables实现
-- [ ] **存储卷** - 数据卷管理
-- [ ] **rootless优化** - 普通用户支持
-- [ ] **性能监控** - 资源使用统计
+- [x] **存储卷管理** - Bind mount/tmpfs/emptyDir/hostPath卷支持
+- [x] **Rootless模式** - UID/GID映射，用户命名空间，无特权容器运行
+- [ ] **性能监控** - 资源使用统计（预留接口）
 
 ---
 
@@ -381,6 +383,8 @@
 - [x] 镜像层管理完成（CAS，GC）
 - [x] 多网络支持完成
 - [x] 安全功能可用
+- [x] 存储卷管理完成
+- [x] Rootless模式支持
 - [ ] 性能达到基本要求
 - [ ] 系统整体稳定
 
