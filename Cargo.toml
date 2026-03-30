@@ -14,6 +14,15 @@ path = "src/lib.rs"
 name = "crius"
 path = "src/main.rs"
 
+[[bin]]
+name = "crius-shim"
+path = "src/shim/main.rs"
+required-features = ["shim"]
+
+[features]
+default = []
+shim = ["fern", "chrono", "ctrlc", "libc"]
+
 [dependencies]
 # 异步运行时
 tokio = { version = "1.0", features = ["full"] }
@@ -48,6 +57,12 @@ tower = "0.4"
 oci-distribution = "0.8.0"
 rand = "0.8.0"
 uuid = { version = "0.8", features = ["v4"] }
+
+# shim 专用依赖（条件编译）
+fern = { version = "0.6", optional = true }
+chrono = { version = "0.4", optional = true }
+ctrlc = { version = "3.4", optional = true }
+libc = { version = "0.2", optional = true }
 
 # 网络相关
 async-trait = "0.1"

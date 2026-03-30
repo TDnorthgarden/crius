@@ -23,6 +23,10 @@ mod server;
 mod image;
 mod proto;
 mod error;
+mod runtime;
+mod oci;
+mod pod;
+mod network;
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
@@ -59,6 +63,7 @@ async fn main() -> Result<(), Error> {
         runtime: "runc".to_string(),
         runtime_root: PathBuf::from("/var/run/runc"),
         log_dir: PathBuf::from("/var/log/crius"),
+        runtime_path: PathBuf::from("/usr/bin/runc"),
     };
 
     // 创建服务实例

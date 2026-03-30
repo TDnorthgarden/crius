@@ -2,16 +2,21 @@
 //!
 //! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
 
+pub mod cgroups;
 pub mod config;
 pub mod error;
 pub mod image;
 pub mod network;
 pub mod oci;
+pub mod pod;
 pub mod runtime;
 pub mod server;
 pub mod storage;
 pub mod utils;
 pub mod proto;
+
+#[cfg(feature = "shim")]
+pub mod shim;
 
 /// 预导入常用模块
 pub mod prelude {
