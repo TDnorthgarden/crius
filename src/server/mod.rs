@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::storage::persistence::{PersistenceManager, PersistenceConfig};
 use crate::proto::runtime::v1::{
     runtime_service_server::RuntimeService, Container, ContainerState, ContainerStatus as CriContainerStatus,
     ExecResponse, ExecSyncResponse,
@@ -42,6 +43,7 @@ use crate::proto::runtime::v1::{
 
 use crate::runtime::{ContainerRuntime, RuncRuntime, ContainerConfig, MountConfig, ContainerStatus};
 use crate::pod::{PodSandboxManager, PodSandboxConfig};
+use crate::storage::{ContainerRecord, PodSandboxRecord};
 
 /// 运行时服务实现
 #[derive(Debug)]
@@ -56,6 +58,8 @@ pub struct RuntimeServiceImpl {
     runtime: RuncRuntime,
     // Pod沙箱管理器
     pod_manager: tokio::sync::Mutex<PodSandboxManager<RuncRuntime>>,
+    // 持久化管理器
+    persistence: Arc<Mutex<PersistenceManager>>,
 }
 
 /// 运行时配置
@@ -80,13 +84,87 @@ impl RuntimeServiceImpl {
             config.root_dir.join("pods"),
         );
         
+        // 初始化持久化管理器
+        let persistence_config = PersistenceConfig {
+            db_path: config.root_dir.join("crius.db"),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        };
+        
+        let persistence = PersistenceManager::new(persistence_config)
+            .expect("Failed to create persistence manager");
+        
         Self {
             containers: Arc::new(Mutex::new(HashMap::new())),
             pod_sandboxes: Arc::new(Mutex::new(HashMap::new())),
             config,
             runtime,
             pod_manager: tokio::sync::Mutex::new(pod_manager),
+            persistence: Arc::new(Mutex::new(persistence)),
         }
+    }
+    
+    /// 从持久化存储恢复状态
+    pub async fn recover_state(&self) -> Result<(), Status> {
+        let mut persistence = self.persistence.lock().await;
+        
+        // 恢复容器状态
+        match persistence.recover_containers() {
+            Ok(containers) => {
+                let mut memory_containers = self.containers.lock().await;
+                for (id, _status, record) in containers {
+                    // 从记录重建容器元数据
+                    let container = Container {
+                        id: id.clone(),
+                        pod_sandbox_id: record.pod_id,
+                        state: match record.state.as_str() {
+                            "created" => ContainerState::ContainerCreated as i32,
+                            "running" => ContainerState::ContainerRunning as i32,
+                            "stopped" => ContainerState::ContainerExited as i32,
+                            _ => ContainerState::ContainerCreated as i32,
+                        },
+                        created_at: record.created_at,
+                        image_ref: record.image,
+                        labels: serde_json::from_str(&record.labels).unwrap_or_default(),
+                        annotations: serde_json::from_str(&record.annotations).unwrap_or_default(),
+                        ..Default::default()
+                    };
+                    memory_containers.insert(id, container);
+                }
+                log::info!("Recovered {} containers from database", memory_containers.len());
+            }
+            Err(e) => {
+                log::error!("Failed to recover containers: {}", e);
+            }
+        }
+        
+        // 恢复Pod沙箱状态
+        match persistence.recover_pods() {
+            Ok(pods) => {
+                let mut memory_pods = self.pod_sandboxes.lock().await;
+                for record in pods {
+                    let pod = crate::proto::runtime::v1::PodSandbox {
+                        id: record.id.clone(),
+                        state: match record.state.as_str() {
+                            "ready" => PodSandboxState::SandboxReady as i32,
+                            "notready" => PodSandboxState::SandboxNotready as i32,
+                            _ => PodSandboxState::SandboxNotready as i32,
+                        },
+                        created_at: record.created_at,
+                        labels: serde_json::from_str(&record.labels).unwrap_or_default(),
+                        annotations: serde_json::from_str(&record.annotations).unwrap_or_default(),
+                        ..Default::default()
+                    };
+                    memory_pods.insert(record.id, pod);
+                }
+                log::info!("Recovered {} pod sandboxes from database", memory_pods.len());
+            }
+            Err(e) => {
+                log::error!("Failed to recover pod sandboxes: {}", e);
+            }
+        }
+        
+        Ok(())
     }
 }
 
@@ -163,9 +241,31 @@ impl RuntimeService for RuntimeServiceImpl {
             ..Default::default()
         };
         
-        // 存储Pod沙箱信息
+        // 存储Pod沙箱信息到内存
         let mut pod_sandboxes = self.pod_sandboxes.lock().await;
-        pod_sandboxes.insert(pod_id.clone(), pod_sandbox);
+        pod_sandboxes.insert(pod_id.clone(), pod_sandbox.clone());
+        drop(pod_sandboxes);
+        
+        // 持久化Pod沙箱状态
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.save_pod_sandbox(
+            &pod_id,
+            "ready",
+            &pod_config.metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
+            &pod_config.metadata.as_ref().map(|m| m.namespace.clone()).unwrap_or_else(|| "default".to_string()),
+            &pod_config.metadata.as_ref().map(|m| m.uid.clone()).unwrap_or_default(),
+            &format!("/var/run/netns/crius-{}-{}", 
+                pod_config.metadata.as_ref().map(|m| m.namespace.clone()).unwrap_or_else(|| "default".to_string()),
+                pod_config.metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default()),
+            &pod_config.labels,
+            &pod_config.annotations,
+            None, // pause_container_id will be set later
+            None, // ip will be set later
+        ) {
+            log::error!("Failed to persist pod sandbox {}: {}", pod_id, e);
+        } else {
+            log::info!("Pod sandbox {} persisted to database", pod_id);
+        }
         
         log::info!("Pod sandbox {} created successfully", pod_id);
         Ok(Response::new(RunPodSandboxResponse { pod_sandbox_id: pod_id }))
@@ -186,10 +286,17 @@ impl RuntimeService for RuntimeServiceImpl {
         pod_manager.stop_pod_sandbox(&pod_id).await
             .map_err(|e| Status::internal(format!("Failed to stop pod sandbox: {}", e)))?;
         
-        // 更新Pod沙箱状态
+        // 更新Pod沙箱状态到内存
         let mut pod_sandboxes = self.pod_sandboxes.lock().await;
         if let Some(pod) = pod_sandboxes.get_mut(&pod_id) {
             pod.state = PodSandboxState::SandboxNotready as i32;
+        }
+        drop(pod_sandboxes);
+        
+        // 更新持久化状态
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.update_pod_state(&pod_id, "notready") {
+            log::error!("Failed to update pod {} state in database: {}", pod_id, e);
         }
         
         log::info!("Pod sandbox {} stopped", pod_id);
@@ -351,6 +458,15 @@ impl RuntimeService for RuntimeServiceImpl {
         // 从内存中移除
         let mut pod_sandboxes = self.pod_sandboxes.lock().await;
         pod_sandboxes.remove(&pod_id);
+        drop(pod_sandboxes);
+        
+        // 从持久化存储中删除
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.delete_pod_sandbox(&pod_id) {
+            log::error!("Failed to delete pod {} from database: {}", pod_id, e);
+        } else {
+            log::info!("Pod sandbox {} removed from database", pod_id);
+        }
         
         log::info!("Pod sandbox {} removed", pod_id);
         Ok(Response::new(RemovePodSandboxResponse { }))
@@ -473,10 +589,27 @@ impl RuntimeService for RuntimeServiceImpl {
             ..Default::default()
         };
         
-        // 存储容器信息
+        // 存储容器信息到内存
         let mut containers = self.containers.lock().await;
-        containers.insert(runtime_container_id.clone(), container);
-        log::info!("Container stored, total containers: {}", containers.len());
+        containers.insert(runtime_container_id.clone(), container.clone());
+        log::info!("Container stored in memory, total containers: {}", containers.len());
+        drop(containers);
+        
+        // 持久化容器状态
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.save_container(
+            &runtime_container_id,
+            &pod_sandbox_id,
+            crate::runtime::ContainerStatus::Created,
+            &config.image.as_ref().map(|i| i.image.clone()).unwrap_or_default(),
+            &config.command,
+            &config.labels,
+            &config.annotations,
+        ) {
+            log::error!("Failed to persist container {}: {}", runtime_container_id, e);
+        } else {
+            log::info!("Container {} persisted to database", runtime_container_id);
+        }
         
         Ok(Response::new(CreateContainerResponse {
             container_id: runtime_container_id,
@@ -509,10 +642,20 @@ impl RuntimeService for RuntimeServiceImpl {
         .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
         .map_err(|e| Status::internal(format!("Failed to start container: {}", e)))?;
 
-        // 更新容器状态
+        // 更新容器状态到内存
         let mut containers = self.containers.lock().await;
         if let Some(container) = containers.get_mut(&container_id) {
             container.state = ContainerState::ContainerRunning as i32;
+        }
+        drop(containers);
+        
+        // 更新持久化状态
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.update_container_state(
+            &container_id,
+            crate::runtime::ContainerStatus::Running,
+        ) {
+            log::error!("Failed to update container {} state in database: {}", container_id, e);
         }
         
         log::info!("Container {} started", container_id);
@@ -539,10 +682,20 @@ impl RuntimeService for RuntimeServiceImpl {
         .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
         .map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))?;
 
-        // 更新容器状态
+        // 更新容器状态到内存
         let mut containers = self.containers.lock().await;
         if let Some(container) = containers.get_mut(&container_id) {
             container.state = ContainerState::ContainerExited as i32;
+        }
+        drop(containers);
+        
+        // 更新持久化状态（标记为已停止）
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.update_container_state(
+            &container_id,
+            crate::runtime::ContainerStatus::Stopped(0),
+        ) {
+            log::error!("Failed to update container {} state in database: {}", container_id, e);
         }
         
         log::info!("Container {} stopped", container_id);
@@ -571,6 +724,15 @@ impl RuntimeService for RuntimeServiceImpl {
         // 从内存中移除
         let mut containers = self.containers.lock().await;
         containers.remove(&container_id);
+        drop(containers);
+        
+        // 从持久化存储中删除
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.delete_container(&container_id) {
+            log::error!("Failed to delete container {} from database: {}", container_id, e);
+        } else {
+            log::info!("Container {} removed from database", container_id);
+        }
         
         log::info!("Container {} removed", container_id);
         Ok(Response::new(RemoveContainerResponse { }))
@@ -665,8 +827,62 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        // 实现 get_container_events 的逻辑
+        log::info!("Get container events");
+        
+        // 创建channel用于事件流
         let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let containers = self.containers.clone();
+        let pods = self.pod_sandboxes.clone();
+        
+        // 在后台任务中读取当前状态并发送
+        tokio::spawn(async move {
+            // 获取当前容器状态
+            let containers_map = containers.lock().await;
+            for (id, container) in containers_map.iter() {
+                let event = ContainerEventResponse {
+                    container_id: id.clone(),
+                    container_event_type: 0, // CONTAINER_CREATED_EVENT
+                    created_at: container.created_at,
+                    pod_sandbox_status: None,
+                    containers_statuses: vec![crate::proto::runtime::v1::ContainerStatus {
+                        id: id.clone(),
+                        metadata: container.metadata.clone(),
+                        state: container.state,
+                        created_at: container.created_at,
+                        ..Default::default()
+                    }],
+                };
+                
+                if let Err(e) = tx.send(Ok(event)).await {
+                    log::error!("Failed to send container event: {}", e);
+                    break;
+                }
+            }
+            drop(containers_map);
+            
+            // 获取当前Pod状态
+            let pods_map = pods.lock().await;
+            for (id, pod) in pods_map.iter() {
+                let event = ContainerEventResponse {
+                    container_id: id.clone(),
+                    container_event_type: 2, // POD_SANDBOX_CREATED_EVENT
+                    created_at: pod.created_at,
+                    pod_sandbox_status: Some(crate::proto::runtime::v1::PodSandboxStatus {
+                        id: id.clone(),
+                        state: pod.state,
+                        created_at: pod.created_at,
+                        ..Default::default()
+                    }),
+                    containers_statuses: vec![],
+                };
+                
+                if let Err(e) = tx.send(Ok(event)).await {
+                    log::error!("Failed to send pod event: {}", e);
+                    break;
+                }
+            }
+        });
+        
         let stream = ReceiverStream::new(rx);
         Ok(Response::new(stream))
     }

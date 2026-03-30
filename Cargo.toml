@@ -21,7 +21,7 @@ required-features = ["shim"]
 
 [features]
 default = []
-shim = ["fern", "chrono", "ctrlc", "libc"]
+shim = ["fern", "ctrlc", "libc"]
 
 [dependencies]
 # 异步运行时
@@ -58,9 +58,12 @@ oci-distribution = "0.8.0"
 rand = "0.8.0"
 uuid = { version = "0.8", features = ["v4"] }
 
+# 状态持久化
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+
 # shim 专用依赖（条件编译）
 fern = { version = "0.6", optional = true }
-chrono = { version = "0.4", optional = true }
 ctrlc = { version = "3.4", optional = true }
 libc = { version = "0.2", optional = true }
 
@@ -71,6 +74,7 @@ tempfile = "3.3"
 
 [dev-dependencies]
 tempfile = "3.3"
+env_logger = "0.10"
 
 [build-dependencies]
 tonic-build = "0.11"

@@ -27,6 +27,7 @@ mod runtime;
 mod oci;
 mod pod;
 mod network;
+mod storage;
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
@@ -68,6 +69,12 @@ async fn main() -> Result<(), Error> {
 
     // 创建服务实例
     let runtime_service = RuntimeServiceImpl::new(runtime_config.clone());
+    
+    // 从持久化存储恢复状态
+    info!("Recovering state from database...");
+    if let Err(e) = runtime_service.recover_state().await {
+        log::error!("Failed to recover state: {}", e);
+    }
     let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin")))
