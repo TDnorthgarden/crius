@@ -7,6 +7,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use log::{info, debug};
 
+pub mod volume;
+pub use volume::{VolumeManager, VolumeConfig, VolumeType, MountedVolume};
+
 /// 存储管理器
 #[derive(Debug)]
 pub struct StorageManager {
