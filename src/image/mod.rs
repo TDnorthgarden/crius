@@ -299,3 +299,5 @@ impl ImageService for ImageServiceImpl {
         Err(Status::not_found("Image not found"))
     }
 }
+
+pub mod layer;

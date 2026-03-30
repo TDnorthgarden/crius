@@ -61,6 +61,7 @@ uuid = { version = "0.8", features = ["v4"] }
 # 状态持久化
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
 
 # shim 专用依赖（条件编译）
 fern = { version = "0.6", optional = true }
