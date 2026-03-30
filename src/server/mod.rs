@@ -761,9 +761,16 @@ impl RuntimeService for RuntimeServiceImpl {
     // 容器统计信息
     async fn container_stats(
         &self,
-        _request: Request<ContainerStatsRequest>,
+        request: Request<ContainerStatsRequest>,
     ) -> Result<Response<ContainerStatsResponse>, Status> {
-        // 实现 container_stats 的逻辑
+        let req = request.into_inner();
+        let container_id = req.container_id;
+        
+        let containers = self.containers.lock().await;
+        let _container = containers.get(&container_id)
+            .ok_or_else(|| Status::not_found("Container not found"))?;
+        
+        // TODO: 从cgroup读取实际统计信息
         Ok(Response::new(ContainerStatsResponse {
             stats: None,
         }))
@@ -774,7 +781,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<ListContainerStatsRequest>,
     ) -> Result<Response<ListContainerStatsResponse>, Status> {
-        // 实现 list_container_stats 的逻辑
+        // TODO: 实现完整的统计列表
         Ok(Response::new(ListContainerStatsResponse {
             stats: Vec::new(),
         }))
@@ -783,9 +790,16 @@ impl RuntimeService for RuntimeServiceImpl {
     // pod沙箱统计信息
     async fn pod_sandbox_stats(
         &self,
-        _request: Request<PodSandboxStatsRequest>,
+        request: Request<PodSandboxStatsRequest>,
     ) -> Result<Response<PodSandboxStatsResponse>, Status> {
-        // 实现 pod_sandbox_stats 的逻辑
+        let req = request.into_inner();
+        let pod_id = req.pod_sandbox_id;
+        
+        let pods = self.pod_sandboxes.lock().await;
+        let _pod = pods.get(&pod_id)
+            .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
+        
+        // TODO: 从cgroup读取实际统计信息
         Ok(Response::new(PodSandboxStatsResponse {
             stats: None,
         }))
@@ -796,7 +810,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<ListPodSandboxStatsRequest>,
     ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
-        // 实现 list_pod_sandbox_stats 的逻辑
+        // TODO: 实现完整的统计列表
         Ok(Response::new(ListPodSandboxStatsResponse {
             stats: Vec::new(),
         }))
@@ -914,18 +928,46 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<RuntimeConfigRequest>,
     ) -> Result<Response<RuntimeConfigResponse>, Status> {
-        // 实现 runtime_config 的逻辑
-        Ok(Response::new(RuntimeConfigResponse {
-            linux: None,
-            
-        }))
+        // 返回当前运行时配置
+        let config = RuntimeConfigResponse {
+            linux: Some(crate::proto::runtime::v1::LinuxRuntimeConfiguration {
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        
+        Ok(Response::new(config))
     }
 
     async fn update_container_resources(
         &self,
-        _request: Request<UpdateContainerResourcesRequest>,
+        request: Request<UpdateContainerResourcesRequest>,
     ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
-        // TODO: 实现资源更新逻辑
-        Ok(Response::new(UpdateContainerResourcesResponse { }))
+        let req = request.into_inner();
+        let container_id = req.container_id;
+        
+        // 检查容器是否存在
+        let containers = self.containers.lock().await;
+        let _container = containers.get(&container_id)
+            .ok_or_else(|| Status::not_found("Container not found"))?;
+        drop(containers);
+        
+        // 获取资源限制
+        let linux = req.linux;
+        let _windows = req.windows;
+        
+        if let Some(resources) = linux {
+            log::info!(
+                "Updating container {} resources: CPU shares={}, Memory limit={}",
+                container_id,
+                resources.cpu_shares,
+                resources.memory_limit_in_bytes
+            );
+            
+            // TODO: 通过runc update命令更新cgroups资源限制
+            // 这需要调用runc update --cpus-shares X --memory-limit Y <container_id>
+        }
+        
+        Ok(Response::new(UpdateContainerResourcesResponse {}))
     }
 }
