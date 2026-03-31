@@ -6,6 +6,7 @@ pub mod cgroups;
 pub mod config;
 pub mod error;
 pub mod image;
+pub mod metrics;
 pub mod network;
 pub mod oci;
 pub mod pod;
