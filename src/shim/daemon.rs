@@ -17,7 +17,7 @@ use log::{info, debug, error, warn};
 use nix::unistd::{self, Pid};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
-use crate::shim::io::{IoManager, IoConfig};
+use super::io::IoManager;
 
 /// Shim守护进程
 pub struct Daemon {

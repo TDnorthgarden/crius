@@ -38,11 +38,13 @@ use crate::proto::runtime::v1::{
     ListPodSandboxStatsRequest,ListPodSandboxStatsResponse,
     UpdateRuntimeConfigRequest,UpdateRuntimeConfigResponse,
     UpdateContainerResourcesRequest,UpdateContainerResourcesResponse,
-    PodSandboxState,PodSandboxStatus,
+    PodSandboxState,PodSandboxStatus, RuntimeCondition, RuntimeStatus,
+    ContainerMetadata, PodSandboxMetadata, ImageSpec,
 };
 
-use crate::runtime::{ContainerRuntime, RuncRuntime, ContainerConfig, MountConfig, ContainerStatus};
+use crate::runtime::{ContainerRuntime, RuncRuntime, ContainerConfig, MountConfig, ContainerStatus, ShimConfig};
 use crate::pod::{PodSandboxManager, PodSandboxConfig};
+use crate::network::{DefaultNetworkManager, NetworkManager};
 use crate::storage::{ContainerRecord, PodSandboxRecord};
 
 /// 运行时服务实现
@@ -70,18 +72,68 @@ pub struct RuntimeConfig {
     pub runtime_root: PathBuf,
     pub log_dir: PathBuf,
     pub runtime_path: PathBuf,
+    pub pause_image: String,
 }
 
 impl RuntimeServiceImpl {
+    fn normalize_timestamp_nanos(ts: i64) -> i64 {
+        // Backward-compatible normalization: old records may still be seconds.
+        if ts > 0 && ts < 1_000_000_000_000 {
+            ts.saturating_mul(1_000_000_000)
+        } else {
+            ts
+        }
+    }
+
+    async fn resolve_pod_sandbox_id(&self, requested_id: &str) -> Result<String, Status> {
+        let pod_sandboxes = self.pod_sandboxes.lock().await;
+        if pod_sandboxes.contains_key(requested_id) {
+            return Ok(requested_id.to_string());
+        }
+
+        let matches: Vec<String> = pod_sandboxes
+            .keys()
+            .filter(|id| id.starts_with(requested_id))
+            .cloned()
+            .collect();
+
+        match matches.len() {
+            0 => Err(Status::not_found("Pod sandbox not found")),
+            1 => Ok(matches[0].clone()),
+            _ => Err(Status::invalid_argument(format!(
+                "ambiguous pod sandbox id prefix: {}",
+                requested_id
+            ))),
+        }
+    }
+
     pub fn new(config: RuntimeConfig) -> Self {
-        let runtime = RuncRuntime::new(
+        let mut shim_config = ShimConfig::default();
+        shim_config.runtime_path = config.runtime_path.clone();
+        shim_config.debug = std::env::var("CRIUS_SHIM_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        shim_config.shim_path = std::env::var("CRIUS_SHIM_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let local = PathBuf::from("/root/crius/target/debug/crius-shim");
+                if local.exists() {
+                    local
+                } else {
+                    PathBuf::from("crius-shim")
+                }
+            });
+
+        let runtime = RuncRuntime::with_shim(
             config.runtime_path.clone(),
             config.runtime_root.clone(),
+            shim_config,
         );
         
         let pod_manager = PodSandboxManager::new(
             runtime.clone(),
             config.root_dir.join("pods"),
+            config.pause_image.clone(),
         );
         
         // 初始化持久化管理器
@@ -235,7 +287,7 @@ impl RuntimeService for RuntimeServiceImpl {
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs() as i64,
+                .as_nanos() as i64,
             labels: pod_config.labels.clone(),
             annotations: pod_config.annotations.clone(),
             ..Default::default()
@@ -277,9 +329,62 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<StopPodSandboxRequest>,
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
         let req = request.into_inner();
-        let pod_id = req.pod_sandbox_id;
+        let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
         
         log::info!("Stopping pod sandbox {}", pod_id);
+
+        // 先停止该Pod下的所有业务容器，避免出现Pod已NotReady但容器仍Running。
+        let container_ids: Vec<String> = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter(|c| c.pod_sandbox_id == pod_id)
+                .map(|c| c.id.clone())
+                .collect()
+        };
+
+        for container_id in &container_ids {
+            let runtime = self.runtime.clone();
+            let container_id_clone = container_id.clone();
+            tokio::task::spawn_blocking(move || {
+                runtime.stop_container(&container_id_clone, Some(30))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to stop container {} in pod {}: {}",
+                    container_id, pod_id, e
+                ))
+            })?;
+        }
+
+        // 更新容器状态到内存
+        {
+            let mut containers = self.containers.lock().await;
+            for container_id in &container_ids {
+                if let Some(container) = containers.get_mut(container_id) {
+                    container.state = ContainerState::ContainerExited as i32;
+                }
+            }
+        }
+
+        // 更新容器持久化状态
+        {
+            let mut persistence = self.persistence.lock().await;
+            for container_id in &container_ids {
+                if let Err(e) = persistence.update_container_state(
+                    container_id,
+                    crate::runtime::ContainerStatus::Stopped(0),
+                ) {
+                    log::error!(
+                        "Failed to update container {} state in database: {}",
+                        container_id,
+                        e
+                    );
+                }
+            }
+        }
         
         // 停止Pod沙箱
         let mut pod_manager = self.pod_manager.lock().await;
@@ -326,9 +431,19 @@ impl RuntimeService for RuntimeServiceImpl {
 
             let status = CriContainerStatus {
                 id: container.id.clone(),
+                metadata: Some(container.metadata.clone().unwrap_or(ContainerMetadata {
+                    name: container.id.clone(),
+                    attempt: 1,
+                })),
                 state: runtime_state as i32,
-                created_at: container.created_at,
+                created_at: Self::normalize_timestamp_nanos(container.created_at),
+                image: Some(ImageSpec {
+                    image: container.image_ref.clone(),
+                    ..Default::default()
+                }),
                 image_ref: container.image_ref.clone(),
+                labels: container.labels.clone(),
+                annotations: container.annotations.clone(),
                 ..Default::default()
             };
             
@@ -347,7 +462,53 @@ impl RuntimeService for RuntimeServiceImpl {
         _request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
         let containers = self.containers.lock().await;
-        let containers_list = containers.values().cloned().collect();
+        let pod_meta_by_id: HashMap<String, (String, String, String)> = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes
+                .iter()
+                .map(|(id, pod)| {
+                    let (name, namespace, uid) = pod
+                        .metadata
+                        .as_ref()
+                        .map(|m| (m.name.clone(), m.namespace.clone(), m.uid.clone()))
+                        .unwrap_or_else(|| {
+                            ("unknown".to_string(), "default".to_string(), id.clone())
+                        });
+                    (id.clone(), (name, namespace, uid))
+                })
+                .collect()
+        };
+        let containers_list = containers
+            .values()
+            .cloned()
+            .map(|mut c| {
+                if c.metadata.is_none() {
+                    c.metadata = Some(ContainerMetadata {
+                        name: c.id.clone(),
+                        attempt: 1,
+                    });
+                }
+                if c.image.is_none() {
+                    c.image = Some(ImageSpec {
+                        image: c.image_ref.clone(),
+                        ..Default::default()
+                    });
+                }
+                if let Some((pod_name, pod_namespace, pod_uid)) = pod_meta_by_id.get(&c.pod_sandbox_id) {
+                    c.labels
+                        .entry("io.kubernetes.pod.name".to_string())
+                        .or_insert_with(|| pod_name.clone());
+                    c.labels
+                        .entry("io.kubernetes.pod.namespace".to_string())
+                        .or_insert_with(|| pod_namespace.clone());
+                    c.labels
+                        .entry("io.kubernetes.pod.uid".to_string())
+                        .or_insert_with(|| pod_uid.clone());
+                }
+                c.created_at = Self::normalize_timestamp_nanos(c.created_at);
+                c
+            })
+            .collect();
         
         Ok(Response::new(ListContainersResponse {
             containers: containers_list,
@@ -433,8 +594,21 @@ impl RuntimeService for RuntimeServiceImpl {
         info.insert("runtime".to_string(), self.config.runtime.clone());
         
         Ok(Response::new(StatusResponse {
-            status: Some(crate::proto::runtime::v1::RuntimeStatus {
-                conditions: Vec::new(),
+            status: Some(RuntimeStatus {
+                conditions: vec![
+                    RuntimeCondition {
+                        r#type: "RuntimeReady".to_string(),
+                        status: true,
+                        reason: "RuntimeIsReady".to_string(),
+                        message: "runtime is ready".to_string(),
+                    },
+                    RuntimeCondition {
+                        r#type: "NetworkReady".to_string(),
+                        status: true,
+                        reason: "NetworkIsReady".to_string(),
+                        message: "network is ready".to_string(),
+                    },
+                ],
             }),
             info,
         }))
@@ -446,14 +620,80 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<RemovePodSandboxRequest>,
     ) -> Result<Response<RemovePodSandboxResponse>, Status> {
         let req = request.into_inner();
-        let pod_id = req.pod_sandbox_id;
+        let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
         
         log::info!("Removing pod sandbox {}", pod_id);
+
+        // Keep a fallback netns name from CRI metadata, so rmp can clean netns
+        // even when PodSandboxManager in-memory state was lost after restart.
+        let fallback_netns_name = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes
+                .get(&pod_id)
+                .and_then(|p| p.metadata.as_ref())
+                .map(|m| format!("crius-{}-{}", m.namespace, m.name))
+        };
         
         // 删除Pod沙箱
         let mut pod_manager = self.pod_manager.lock().await;
         pod_manager.remove_pod_sandbox(&pod_id).await
             .map_err(|e| Status::internal(format!("Failed to remove pod sandbox: {}", e)))?;
+
+        // 级联删除该Pod下的所有容器（匹配containerd/CRI-O期望行为）
+        let container_ids: Vec<String> = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter(|c| c.pod_sandbox_id == pod_id)
+                .map(|c| c.id.clone())
+                .collect()
+        };
+
+        for container_id in &container_ids {
+            let runtime = self.runtime.clone();
+            let container_id_clone = container_id.clone();
+            tokio::task::spawn_blocking(move || {
+                runtime.remove_container(&container_id_clone)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to remove container {} in pod {}: {}",
+                    container_id, pod_id, e
+                ))
+            })?;
+        }
+
+        // 从内存中移除容器
+        {
+            let mut containers = self.containers.lock().await;
+            for container_id in &container_ids {
+                containers.remove(container_id);
+            }
+        }
+
+        // 从持久化中移除容器
+        {
+            let mut persistence = self.persistence.lock().await;
+            for container_id in &container_ids {
+                if let Err(e) = persistence.delete_container(container_id) {
+                    log::error!(
+                        "Failed to delete container {} from database: {}",
+                        container_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Best-effort fallback cleanup for stale netns.
+        if let Some(netns_name) = fallback_netns_name {
+            let network_manager = DefaultNetworkManager::new(None, None, None);
+            if let Err(e) = network_manager.remove_network_namespace(&netns_name).await {
+                log::warn!("Fallback netns cleanup failed for {}: {}", netns_name, e);
+            }
+        }
         
         // 从内存中移除
         let mut pod_sandboxes = self.pod_sandboxes.lock().await;
@@ -478,9 +718,10 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<PodSandboxStatusRequest>,
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
         let req = request.into_inner();
+        let resolved_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
         let pod_sandboxes = self.pod_sandboxes.lock().await;
         
-        if let Some(pod_sandbox) = pod_sandboxes.get(&req.pod_sandbox_id) {
+        if let Some(pod_sandbox) = pod_sandboxes.get(&resolved_id) {
             let mut info = HashMap::new();
             info.insert("podSandboxId".to_string(), pod_sandbox.id.clone());
             if let Some(metadata) = &pod_sandbox.metadata {
@@ -488,8 +729,17 @@ impl RuntimeService for RuntimeServiceImpl {
             }
             
             let status = PodSandboxStatus {
+                id: pod_sandbox.id.clone(),
+                metadata: Some(pod_sandbox.metadata.clone().unwrap_or(PodSandboxMetadata {
+                    name: pod_sandbox.id.clone(),
+                    uid: pod_sandbox.id.clone(),
+                    namespace: "default".to_string(),
+                    attempt: 1,
+                })),
                 state: pod_sandbox.state,
-                created_at: pod_sandbox.created_at,
+                created_at: Self::normalize_timestamp_nanos(pod_sandbox.created_at),
+                labels: pod_sandbox.labels.clone(),
+                annotations: pod_sandbox.annotations.clone(),
                 ..Default::default()
             };
             
@@ -513,7 +763,22 @@ impl RuntimeService for RuntimeServiceImpl {
         _request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
         let pod_sandboxes = self.pod_sandboxes.lock().await;
-        let items = pod_sandboxes.values().cloned().collect();
+        let items = pod_sandboxes
+            .values()
+            .cloned()
+            .map(|mut p| {
+                if p.metadata.is_none() {
+                    p.metadata = Some(PodSandboxMetadata {
+                        name: p.id.clone(),
+                        uid: p.id.clone(),
+                        namespace: "default".to_string(),
+                        attempt: 1,
+                    });
+                }
+                p.created_at = Self::normalize_timestamp_nanos(p.created_at);
+                p
+            })
+            .collect();
         
         Ok(Response::new(ListPodSandboxResponse {
             items,
@@ -530,7 +795,7 @@ impl RuntimeService for RuntimeServiceImpl {
         let pod_sandbox_id = req.pod_sandbox_id.clone();
         let config = req.config.ok_or_else(|| Status::invalid_argument("Container config not specified"))?;
         
-        let container_id = format!("container-{}", uuid::Uuid::new_v4());
+        let container_id = uuid::Uuid::new_v4().to_simple().to_string();
         
         log::info!("Creating container with ID: {}", container_id);
         log::debug!("Container config: {:?}", config);
@@ -566,9 +831,8 @@ impl RuntimeService for RuntimeServiceImpl {
         
         // 调用runtime创建容器（在阻塞线程中执行）
         let runtime = self.runtime.clone();
-        let runtime_container_id = container_id.clone();
         let container_config_clone = container_config.clone();
-        let _created_id = tokio::task::spawn_blocking(move || {
+        let created_id = tokio::task::spawn_blocking(move || {
             runtime.create_container(&container_config_clone)
         }).await
         .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
@@ -576,13 +840,13 @@ impl RuntimeService for RuntimeServiceImpl {
         
         // 创建容器元数据
         let container = Container {
-            id: runtime_container_id.clone(),
+            id: created_id.clone(),
             pod_sandbox_id: pod_sandbox_id.clone(),
             state: ContainerState::ContainerCreated as i32,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs() as i64,
+                .as_nanos() as i64,
             labels: config.labels.clone(),
             metadata: config.metadata.clone(),
             image_ref: config.image.as_ref().map(|i| i.image.clone()).unwrap_or_default(),
@@ -591,14 +855,14 @@ impl RuntimeService for RuntimeServiceImpl {
         
         // 存储容器信息到内存
         let mut containers = self.containers.lock().await;
-        containers.insert(runtime_container_id.clone(), container.clone());
+        containers.insert(created_id.clone(), container.clone());
         log::info!("Container stored in memory, total containers: {}", containers.len());
         drop(containers);
         
         // 持久化容器状态
         let mut persistence = self.persistence.lock().await;
         if let Err(e) = persistence.save_container(
-            &runtime_container_id,
+            &created_id,
             &pod_sandbox_id,
             crate::runtime::ContainerStatus::Created,
             &config.image.as_ref().map(|i| i.image.clone()).unwrap_or_default(),
@@ -606,13 +870,13 @@ impl RuntimeService for RuntimeServiceImpl {
             &config.labels,
             &config.annotations,
         ) {
-            log::error!("Failed to persist container {}: {}", runtime_container_id, e);
+            log::error!("Failed to persist container {}: {}", created_id, e);
         } else {
-            log::info!("Container {} persisted to database", runtime_container_id);
+            log::info!("Container {} persisted to database", created_id);
         }
         
         Ok(Response::new(CreateContainerResponse {
-            container_id: runtime_container_id,
+            container_id: created_id,
         }))
     }
 

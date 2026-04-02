@@ -96,6 +96,8 @@ pub struct PodSandboxManager<R: ContainerRuntime> {
     network_manager: DefaultNetworkManager,
     /// Pod沙箱根目录
     root_dir: PathBuf,
+    /// 默认pause镜像（CRI-O风格：由运行时配置提供）
+    pause_image: String,
     /// 运行中的Pod沙箱
     pods: HashMap<String, PodSandbox>,
 }
@@ -104,27 +106,46 @@ impl<R: ContainerRuntime> std::fmt::Debug for PodSandboxManager<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PodSandboxManager")
             .field("root_dir", &self.root_dir)
+            .field("pause_image", &self.pause_image)
             .field("pods", &self.pods)
             .finish()
     }
 }
 
 impl<R: ContainerRuntime> PodSandboxManager<R> {
+    fn resolve_pause_image(&self, pod_config: &PodSandboxConfig) -> Result<String> {
+        // Match CRI-O behavior: configured pause image is the default source.
+        // Allow kubelet-provided sandbox image annotation to override when present.
+        for (k, v) in &pod_config.annotations {
+            if k == "io.kubernetes.cri.sandbox-image" && !v.trim().is_empty() {
+                return Ok(v.clone());
+            }
+        }
+
+        if self.pause_image.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "pause image is not configured"
+            ));
+        }
+        Ok(self.pause_image.clone())
+    }
+
     /// 创建新的Pod沙箱管理器
-    pub fn new(runtime: R, root_dir: PathBuf) -> Self {
+    pub fn new(runtime: R, root_dir: PathBuf, pause_image: String) -> Self {
         let network_manager = DefaultNetworkManager::new(None, None, None);
         
         Self {
             runtime,
             network_manager,
             root_dir,
+            pause_image,
             pods: HashMap::new(),
         }
     }
 
     /// 创建Pod沙箱
     pub async fn create_pod_sandbox(&mut self, config: PodSandboxConfig) -> Result<String> {
-        let pod_id = format!("pod-{}", uuid::Uuid::new_v4());
+        let pod_id = uuid::Uuid::new_v4().to_simple().to_string();
         info!("Creating pod sandbox {} (name: {}, namespace: {})", 
               pod_id, config.name, config.namespace);
 
@@ -181,10 +202,12 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         pod_config: &PodSandboxConfig,
         netns_path: &Path,
     ) -> Result<String> {
+        let pause_image = self.resolve_pause_image(pod_config)?;
+
         // Pause容器配置
         let pause_config = ContainerConfig {
             name: format!("pause-{}", pod_id),
-            image: "registry.k8s.io/pause:3.9".to_string(),
+            image: pause_image,
             command: vec!["/pause".to_string()],
             args: vec![],
             env: vec![],
@@ -336,7 +359,11 @@ mod tests {
             temp_dir.path().join("runtime"),
         );
 
-        let mut manager = PodSandboxManager::new(runtime, temp_dir.path().join("pods"));
+        let mut manager = PodSandboxManager::new(
+            runtime,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+        );
 
         let config = PodSandboxConfig {
             name: "test-pod".to_string(),

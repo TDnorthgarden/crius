@@ -7,13 +7,11 @@
 //! 4. IO流管理（stdin/stdout/stderr重定向）
 //! 5. 信号传递
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::fs;
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{info, error, debug};
+use log::{info, debug};
 
 mod daemon;
 mod subreaper;
@@ -72,11 +70,7 @@ fn main() -> Result<()> {
         return Err(anyhow::anyhow!("config.json not found in bundle: {:?}", config_path));
     }
 
-    // 验证rootfs
-    let rootfs_path = args.bundle.join("rootfs");
-    if !rootfs_path.exists() {
-        return Err(anyhow::anyhow!("rootfs not found in bundle: {:?}", rootfs_path));
-    }
+    // rootfs 不再要求位于 bundle/rootfs，实际路径以 OCI config.json 的 root.path 为准。
 
     // 创建并运行shim守护进程
     let daemon = Daemon::new(
