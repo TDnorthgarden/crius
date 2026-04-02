@@ -62,9 +62,13 @@ async fn main() -> Result<(), Error> {
     let runtime_config = RuntimeConfig {
         root_dir: PathBuf::from("/var/lib/crius"),
         runtime: "runc".to_string(),
-        runtime_root: PathBuf::from("/var/run/runc"),
+        // Keep runc state root (/run/runc) separate from crius bundle root.
+        // Using /var/run/runc for bundles causes "container ID already exists".
+        runtime_root: PathBuf::from("/var/lib/crius/runc-bundles"),
         log_dir: PathBuf::from("/var/log/crius"),
         runtime_path: PathBuf::from("/usr/bin/runc"),
+        pause_image: std::env::var("CRIUS_PAUSE_IMAGE")
+            .unwrap_or_else(|_| "registry.k8s.io/pause:3.9".to_string()),
     };
 
     // 创建服务实例

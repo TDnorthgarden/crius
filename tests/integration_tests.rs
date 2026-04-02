@@ -252,6 +252,7 @@ mod pod_tests {
         let manager = PodSandboxManager::new(
             runtime,
             temp_dir.join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
         );
         
         // 验证创建成功 - 检查Debug输出包含root_dir

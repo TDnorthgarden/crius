@@ -61,6 +61,13 @@ pub struct DefaultNetworkManager {
 }
 
 impl DefaultNetworkManager {
+    fn netns_exists(ns: &str) -> bool {
+        let p = Path::new(ns);
+        p.exists()
+            || Path::new("/var/run/netns").join(ns).exists()
+            || Path::new("/run/netns").join(ns).exists()
+    }
+
     /// 创建新的网络管理器实例
     pub fn new(
         cni_plugin_dirs: Option<Vec<String>>,
@@ -94,7 +101,7 @@ impl NetworkManager for DefaultNetworkManager {
     }
 
     async fn create_network_namespace(&self, ns_path: &str) -> Result<(), NetworkError> {
-        if !Path::new(ns_path).exists() {
+        if !DefaultNetworkManager::netns_exists(ns_path) {
             let status = Command::new("ip")
                 .args(["netns", "add", ns_path])
                 .status()
@@ -111,7 +118,7 @@ impl NetworkManager for DefaultNetworkManager {
     }
 
     async fn remove_network_namespace(&self, ns_path: &str) -> Result<(), NetworkError> {
-        if Path::new(ns_path).exists() {
+        if DefaultNetworkManager::netns_exists(ns_path) {
             let status = Command::new("ip")
                 .args(["netns", "delete", ns_path])
                 .status()
