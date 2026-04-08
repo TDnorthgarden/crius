@@ -94,7 +94,11 @@ async fn main() -> Result<(), Error> {
 
     // 创建服务实例
     let runtime_service = RuntimeServiceImpl::new(runtime_config.clone());
-    let streaming_server = crate::streaming::StreamingServer::start("127.0.0.1:0").await?;
+    let streaming_server = crate::streaming::StreamingServer::start(
+        "127.0.0.1:0",
+        runtime_config.runtime_path.clone(),
+    )
+    .await?;
     runtime_service
         .set_streaming_server(streaming_server.clone())
         .await;
