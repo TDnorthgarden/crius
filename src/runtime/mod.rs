@@ -41,6 +41,14 @@ pub trait ContainerRuntime {
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32>;
 }
 
+/// 容器内命令执行结果
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecResult {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+}
+
 /// 容器配置
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -875,6 +883,51 @@ impl RuncRuntime {
             _ => Ok(None),
         }
     }
+
+    pub fn build_exec_command(&self, container_id: &str, command: &[String], tty: bool) -> Command {
+        let mut cmd = Command::new(&self.runtime_path);
+        cmd.arg("exec");
+
+        if tty {
+            cmd.arg("-t");
+        }
+
+        cmd.arg(container_id);
+        for arg in command {
+            cmd.arg(arg);
+        }
+
+        cmd
+    }
+
+    pub fn exec_in_container_capture(
+        &self,
+        container_id: &str,
+        command: &[String],
+        tty: bool,
+    ) -> Result<ExecResult> {
+        info!(
+            "Executing command in container {}: {:?}",
+            container_id, command
+        );
+
+        let output = self
+            .build_exec_command(container_id, command, tty)
+            .output()
+            .context("Failed to execute runc exec")?;
+
+        let exit_code = output.status.code().unwrap_or_default();
+        info!(
+            "Command executed in container {} with exit code {}",
+            container_id, exit_code
+        );
+
+        Ok(ExecResult {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            exit_code,
+        })
+    }
 }
 
 impl ContainerRuntime for RuncRuntime {
@@ -1066,42 +1119,8 @@ impl ContainerRuntime for RuncRuntime {
     }
 
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32> {
-        info!(
-            "Executing command in container {}: {:?}",
-            container_id, command
-        );
-
-        let mut cmd = std::process::Command::new(&self.runtime_path);
-        cmd.arg("exec");
-
-        if tty {
-            cmd.arg("-t");
-        }
-        cmd.arg("-i"); // 始终启用stdin交互
-
-        // 添加容器ID
-        cmd.arg(container_id);
-
-        // 添加命令
-        for arg in command {
-            cmd.arg(arg);
-        }
-
-        // 执行命令并等待结果
-        let output = cmd.output().context("Failed to execute runc exec")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("exec failed: {}", stderr));
-        }
-
-        // 返回退出码
-        let exit_code = output.status.code().unwrap_or(0);
-        info!(
-            "Command executed in container {} with exit code {}",
-            container_id, exit_code
-        );
-        Ok(exit_code)
+        let result = self.exec_in_container_capture(container_id, command, tty)?;
+        Ok(result.exit_code)
     }
 }
 

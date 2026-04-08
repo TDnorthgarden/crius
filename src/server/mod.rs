@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -1659,44 +1662,82 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<ExecSyncRequest>,
     ) -> Result<Response<ExecSyncResponse>, Status> {
         let req = request.into_inner();
-        let container_id = req.container_id;
+        let container_id = self.resolve_container_id(&req.container_id).await?;
         let cmd = req.cmd;
         let timeout = req.timeout;
 
         log::info!("Exec sync in container {}: {:?}", container_id, cmd);
 
-        // 检查容器是否存在
-        let containers = self.containers.lock().await;
-        if !containers.contains_key(&container_id) {
-            return Err(Status::not_found("Container not found"));
+        if cmd.is_empty() {
+            return Err(Status::invalid_argument("cmd must not be empty"));
         }
-        drop(containers);
 
-        // 调用runtime执行命令
-        let runtime = self.runtime.clone();
-        let container_id_clone = container_id.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            runtime.exec_in_container(&container_id_clone, &cmd, false)
-        })
-        .await;
+        let mut command =
+            TokioCommand::from(self.runtime.build_exec_command(&container_id, &cmd, false));
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
 
-        match result {
-            Ok(Ok(exit_code)) => {
-                Ok(Response::new(ExecSyncResponse {
-                    stdout: Vec::new(), // TODO: 捕获stdout
-                    stderr: Vec::new(), // TODO: 捕获stderr
-                    exit_code,
-                }))
+        let mut child = command
+            .spawn()
+            .map_err(|e| Status::internal(format!("Failed to spawn exec process: {}", e)))?;
+
+        let stdout_task = child.stdout.take().map(|mut stdout| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                stdout.read_to_end(&mut buf).await.map(|_| buf)
+            })
+        });
+        let stderr_task = child.stderr.take().map(|mut stderr| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                stderr.read_to_end(&mut buf).await.map(|_| buf)
+            })
+        });
+
+        let status = if timeout > 0 {
+            let timeout = std::time::Duration::from_secs(timeout as u64);
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(status)) => status,
+                Ok(Err(e)) => {
+                    return Err(Status::internal(format!("Exec failed: {}", e)));
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(Status::deadline_exceeded(format!(
+                        "Exec sync timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
             }
-            Ok(Err(e)) => {
-                log::error!("Exec failed in container {}: {}", container_id, e);
-                Err(Status::internal(format!("Exec failed: {}", e)))
-            }
-            Err(e) => Err(Status::internal(format!(
-                "Failed to spawn blocking task: {}",
-                e
-            ))),
-        }
+        } else {
+            child
+                .wait()
+                .await
+                .map_err(|e| Status::internal(format!("Exec failed: {}", e)))?
+        };
+
+        let stdout = match stdout_task {
+            Some(task) => task
+                .await
+                .map_err(|e| Status::internal(format!("Failed to join stdout task: {}", e)))?
+                .map_err(|e| Status::internal(format!("Failed to read stdout: {}", e)))?,
+            None => Vec::new(),
+        };
+        let stderr = match stderr_task {
+            Some(task) => task
+                .await
+                .map_err(|e| Status::internal(format!("Failed to join stderr task: {}", e)))?
+                .map_err(|e| Status::internal(format!("Failed to read stderr: {}", e)))?,
+            None => Vec::new(),
+        };
+
+        Ok(Response::new(ExecSyncResponse {
+            stdout,
+            stderr,
+            exit_code: status.code().unwrap_or_default(),
+        }))
     }
 
     // 端口转发
