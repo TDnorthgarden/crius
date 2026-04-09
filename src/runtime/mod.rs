@@ -8,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::cgroups::{to_oci_resources, CpuLimit, MemoryLimit, ResourceLimits};
+use crate::cgroups::{CgroupManager, to_oci_resources, CpuLimit, MemoryLimit, ResourceLimits};
 use crate::oci::spec::{
     Device as OciDevice, Linux, LinuxCapabilities, LinuxDeviceCgroup, LinuxResources, Mount,
     Namespace as OciNamespace, Process, Root, Spec, User,
@@ -39,14 +39,13 @@ pub trait ContainerRuntime {
 
     /// 在容器中执行命令
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32>;
-}
 
-/// 容器内命令执行结果
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ExecResult {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
+    /// 更新容器资源限制
+    fn update_container_resources(
+        &self,
+        container_id: &str,
+        resources: &LinuxContainerResources,
+    ) -> Result<()>;
 }
 
 /// 容器配置
@@ -884,49 +883,34 @@ impl RuncRuntime {
         }
     }
 
-    pub fn build_exec_command(&self, container_id: &str, command: &[String], tty: bool) -> Command {
-        let mut cmd = Command::new(&self.runtime_path);
-        cmd.arg("exec");
-
-        if tty {
-            cmd.arg("-t");
+    /// 将 CRI LinuxContainerResources 转换为 ResourceLimits
+    fn cri_to_limits(resources: &LinuxContainerResources) -> ResourceLimits {
+        ResourceLimits {
+            cpu: Some(CpuLimit {
+                shares: (resources.cpu_shares > 0).then_some(resources.cpu_shares as u64),
+                quota: (resources.cpu_quota > 0).then_some(resources.cpu_quota),
+                period: (resources.cpu_period > 0).then_some(resources.cpu_period as u64),
+                realtime_runtime: None,
+                realtime_period: None,
+                cpus: (!resources.cpuset_cpus.is_empty()).then(|| resources.cpuset_cpus.clone()),
+                mems: (!resources.cpuset_mems.is_empty()).then(|| resources.cpuset_mems.clone()),
+            }),
+            memory: Some(MemoryLimit {
+                limit: (resources.memory_limit_in_bytes > 0)
+                    .then_some(resources.memory_limit_in_bytes),
+                reservation: None,
+                swap: (resources.memory_swap_limit_in_bytes > 0)
+                    .then_some(resources.memory_swap_limit_in_bytes),
+                kernel: None,
+                kernel_tcp: None,
+                swappiness: None,
+                disable_oom_killer: None,
+                use_hierarchy: None,
+            }),
+            blkio: None,
+            network: None,
+            pids: None,
         }
-
-        cmd.arg(container_id);
-        for arg in command {
-            cmd.arg(arg);
-        }
-
-        cmd
-    }
-
-    pub fn exec_in_container_capture(
-        &self,
-        container_id: &str,
-        command: &[String],
-        tty: bool,
-    ) -> Result<ExecResult> {
-        info!(
-            "Executing command in container {}: {:?}",
-            container_id, command
-        );
-
-        let output = self
-            .build_exec_command(container_id, command, tty)
-            .output()
-            .context("Failed to execute runc exec")?;
-
-        let exit_code = output.status.code().unwrap_or_default();
-        info!(
-            "Command executed in container {} with exit code {}",
-            container_id, exit_code
-        );
-
-        Ok(ExecResult {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            exit_code,
-        })
     }
 }
 
@@ -1119,8 +1103,66 @@ impl ContainerRuntime for RuncRuntime {
     }
 
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32> {
-        let result = self.exec_in_container_capture(container_id, command, tty)?;
-        Ok(result.exit_code)
+        info!(
+            "Executing command in container {}: {:?}",
+            container_id, command
+        );
+
+        let mut cmd = std::process::Command::new(&self.runtime_path);
+        cmd.arg("exec");
+
+        if tty {
+            cmd.arg("-t");
+        }
+        cmd.arg("-i"); // 始终启用stdin交互
+
+        // 添加容器ID
+        cmd.arg(container_id);
+
+        // 添加命令
+        for arg in command {
+            cmd.arg(arg);
+        }
+
+        // 执行命令并等待结果
+        let output = cmd.output().context("Failed to execute runc exec")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("exec failed: {}", stderr));
+        }
+
+        // 返回退出码
+        let exit_code = output.status.code().unwrap_or(0);
+        info!(
+            "Command executed in container {} with exit code {}",
+            container_id, exit_code
+        );
+        Ok(exit_code)
+    }
+
+    fn update_container_resources(
+        &self,
+        container_id: &str,
+        resources: &LinuxContainerResources,
+    ) -> Result<()> {
+        info!(
+            "Updating container {} resources: CPU shares={}, Memory limit={}",
+            container_id, resources.cpu_shares, resources.memory_limit_in_bytes
+        );
+
+        // 将 CRI LinuxContainerResources 转换为 ResourceLimits
+        let limits = Self::cri_to_limits(resources);
+
+        // 使用 CgroupManager 直接更新 cgroup 资源
+        let cgroup_manager = CgroupManager::new(container_id.to_string())
+            .context("Failed to create cgroup manager")?;
+        cgroup_manager
+            .set_resources(&limits)
+            .context("Failed to set cgroup resources")?;
+
+        info!("Container {} resources updated successfully", container_id);
+        Ok(())
     }
 }
 
@@ -1370,5 +1412,67 @@ mod tests {
             Some("system_u:system_r:container_t:s0")
         );
         assert!(linux.seccomp.is_some());
+    }
+
+    #[test]
+    fn test_cri_to_limits() {
+        let resources = LinuxContainerResources {
+            cpu_period: 100000,
+            cpu_quota: 200000,
+            cpu_shares: 1024,
+            memory_limit_in_bytes: 1073741824, // 1GB
+            oom_score_adj: 0,
+            cpuset_cpus: "0-3".to_string(),
+            cpuset_mems: "0".to_string(),
+            hugepage_limits: vec![],
+            unified: HashMap::new(),
+            memory_swap_limit_in_bytes: 2147483648, // 2GB
+        };
+
+        let limits = RuncRuntime::cri_to_limits(&resources);
+
+        // 验证 CPU 限制
+        let cpu = limits.cpu.as_ref().unwrap();
+        assert_eq!(cpu.shares, Some(1024));
+        assert_eq!(cpu.quota, Some(200000));
+        assert_eq!(cpu.period, Some(100000));
+        assert_eq!(cpu.cpus.as_deref(), Some("0-3"));
+        assert_eq!(cpu.mems.as_deref(), Some("0"));
+
+        // 验证内存限制
+        let memory = limits.memory.as_ref().unwrap();
+        assert_eq!(memory.limit, Some(1073741824));
+        assert_eq!(memory.swap, Some(2147483648));
+    }
+
+    #[test]
+    fn test_cri_to_limits_zero_values() {
+        // 测试零值被过滤（不设置）
+        let resources = LinuxContainerResources {
+            cpu_period: 0,
+            cpu_quota: 0,
+            cpu_shares: 0,
+            memory_limit_in_bytes: 0,
+            oom_score_adj: 0,
+            cpuset_cpus: "".to_string(),
+            cpuset_mems: "".to_string(),
+            hugepage_limits: vec![],
+            unified: HashMap::new(),
+            memory_swap_limit_in_bytes: 0,
+        };
+
+        let limits = RuncRuntime::cri_to_limits(&resources);
+
+        // 零值应该被过滤为 None
+        let cpu = limits.cpu.as_ref().unwrap();
+        assert_eq!(cpu.shares, None);
+        assert_eq!(cpu.quota, None);
+        assert_eq!(cpu.period, None);
+        assert_eq!(cpu.cpus, None);
+        assert_eq!(cpu.mems, None);
+
+        let memory = limits.memory.as_ref().unwrap();
+        assert_eq!(memory.limit, None);
+        assert_eq!(memory.swap, None);
     }
 }
