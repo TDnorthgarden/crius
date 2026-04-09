@@ -4,16 +4,42 @@
 //! 1. 重定向容器IO流到文件或socket
 //! 2. 支持attach功能（多客户端连接）
 //! 3. 支持TTY模式
-//! 4. 日志持久化
+//! 4. 日志持久化（CRI JSON格式）
 
 use crate::attach::{encode_attach_output_frame, ATTACH_PIPE_STDERR, ATTACH_PIPE_STDOUT};
 use anyhow::{Context, Result};
 use log::{debug, error, info};
+use serde::Serialize;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// CRI 日志条目格式
+#[derive(Debug, Serialize)]
+struct CrictlLogEntry {
+    time: String,
+    stream: String,
+    log: String,
+}
+
+impl CrictlLogEntry {
+    fn new(stream: &str, data: &[u8]) -> Self {
+        Self {
+            time: chrono::Utc::now().to_rfc3339(),
+            stream: stream.to_string(),
+            log: String::from_utf8_lossy(data).to_string(),
+        }
+    }
+
+    fn to_json_line(&self) -> Result<Vec<u8>> {
+        let json = serde_json::to_vec(self)?;
+        let mut line = json;
+        line.push(b'\n');
+        Ok(line)
+    }
+}
 
 /// IO配置
 #[derive(Debug, Clone)]
@@ -169,10 +195,13 @@ impl IoManager {
 
     /// 写入stdout
     pub fn write_stdout(&self, data: &[u8]) -> Result<()> {
-        // 写入日志文件
+        // 写入日志文件（CRI JSON格式）
         if let Some(file) = &mut *self.log_file.lock().unwrap() {
-            file.write_all(data)?;
-            file.flush()?;
+            let log_entry = CrictlLogEntry::new("stdout", data);
+            if let Ok(json_line) = log_entry.to_json_line() {
+                file.write_all(&json_line)?;
+                file.flush()?;
+            }
         }
 
         // 发送到所有attach客户端
@@ -183,9 +212,13 @@ impl IoManager {
 
     /// 写入stderr
     pub fn write_stderr(&self, data: &[u8]) -> Result<()> {
+        // 写入日志文件（CRI JSON格式）
         if let Some(file) = &mut *self.log_file.lock().unwrap() {
-            file.write_all(data)?;
-            file.flush()?;
+            let log_entry = CrictlLogEntry::new("stderr", data);
+            if let Ok(json_line) = log_entry.to_json_line() {
+                file.write_all(&json_line)?;
+                file.flush()?;
+            }
         }
 
         self.broadcast_output(ATTACH_PIPE_STDERR, data)
