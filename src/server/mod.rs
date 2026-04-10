@@ -1163,9 +1163,12 @@ impl RuntimeService for RuntimeServiceImpl {
                 })
                 .collect(),
             network_config: None,
-            cgroup_parent: linux_config.as_ref().and_then(|linux| {
-                (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
-            }),
+            cgroup_parent: linux_config
+                .as_ref()
+                .and_then(|linux| {
+                    (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
+                })
+                .or_else(|| Some("crius".to_string())),
             sysctls: linux_config
                 .as_ref()
                 .map(|linux| linux.sysctls.clone())
@@ -1600,6 +1603,9 @@ impl RuntimeService for RuntimeServiceImpl {
                 })
                 .collect()
         };
+
+        // 克隆 runtime 以在闭包中使用
+        let runtime = self.runtime.clone();
         let containers_list = containers
             .values()
             .cloned()
@@ -1631,6 +1637,19 @@ impl RuntimeService for RuntimeServiceImpl {
                         .or_insert_with(|| pod_uid.clone());
                 }
                 c.created_at = Self::normalize_timestamp_nanos(c.created_at);
+
+                // 查询 runtime 获取实时状态，确保与 runc list 一致
+                let runtime_state = match runtime.container_status(&c.id) {
+                    Ok(status) => match status {
+                        ContainerStatus::Created => ContainerState::ContainerCreated as i32,
+                        ContainerStatus::Running => ContainerState::ContainerRunning as i32,
+                        ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
+                        ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
+                    },
+                    Err(_) => ContainerState::ContainerUnknown as i32,
+                };
+                c.state = runtime_state;
+
                 c
             })
             .filter(|c| {
@@ -2992,10 +3011,19 @@ impl RuntimeService for RuntimeServiceImpl {
 
         // 检查容器是否存在
         let containers = self.containers.lock().await;
-        let _container = containers
+        let container = containers
             .get(&container_id)
             .ok_or_else(|| Status::not_found("Container not found"))?;
+
+        // 检查容器状态，只有 running 状态的容器才能更新资源
+        let is_running = container.state == ContainerState::ContainerRunning as i32;
         drop(containers);
+
+        if !is_running {
+            return Err(Status::failed_precondition(
+                "Container must be in RUNNING state to update resources",
+            ));
+        }
 
         // 获取资源限制
         let linux = req.linux;
@@ -3009,8 +3037,12 @@ impl RuntimeService for RuntimeServiceImpl {
                 resources.memory_limit_in_bytes
             );
 
-            // TODO: 通过runc update命令更新cgroups资源限制
-            // 这需要调用runc update --cpus-shares X --memory-limit Y <container_id>
+            // 调用 runtime 更新容器资源
+            self.runtime
+                .update_container_resources(&container_id, &resources)
+                .map_err(|e| Status::internal(format!("Failed to update container resources: {}", e)))?;
+
+            log::info!("Container {} resources updated successfully", container_id);
         }
 
         Ok(Response::new(UpdateContainerResourcesResponse {}))
