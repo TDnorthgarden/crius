@@ -22,6 +22,7 @@ mod attach;
 mod cgroups;
 mod error;
 mod image;
+mod metrics;
 mod network;
 mod oci;
 mod pod;

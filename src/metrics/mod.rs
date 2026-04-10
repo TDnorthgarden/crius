@@ -174,7 +174,7 @@ impl MetricsCollector {
     pub fn collect_container_stats(
         &self,
         container_id: &str,
-        cgroup_path: &Path,
+        _cgroup_path: &Path,
     ) -> Result<ContainerStats> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -187,24 +187,43 @@ impl MetricsCollector {
             ..Default::default()
         };
 
-        // 采集CPU统计
-        if let Ok(cpu) = self.collect_cpu_stats(cgroup_path) {
-            stats.cpu = Some(cpu);
+        // 尝试找到容器的cgroup路径
+        let cgroup_base = if self.cgroup_v2 {
+            PathBuf::from("/sys/fs/cgroup")
+        } else {
+            PathBuf::from("/sys/fs/cgroup")
+        };
+
+        // 采集CPU统计 - 尝试找到正确的cgroup路径
+        let cpu_path = self.find_cgroup_path(&cgroup_base, container_id, "cpu,cpuacct");
+        if let Some(ref path) = cpu_path {
+            if let Ok(cpu) = self.collect_cpu_stats(path) {
+                stats.cpu = Some(cpu);
+            }
         }
 
         // 采集内存统计
-        if let Ok(memory) = self.collect_memory_stats(cgroup_path) {
-            stats.memory = Some(memory);
+        let memory_path = self.find_cgroup_path(&cgroup_base, container_id, "memory");
+        if let Some(ref path) = memory_path {
+            if let Ok(memory) = self.collect_memory_stats(path) {
+                stats.memory = Some(memory);
+            }
         }
 
         // 采集块IO统计
-        if let Ok(blkio) = self.collect_blkio_stats(cgroup_path) {
-            stats.blkio = Some(blkio);
+        let blkio_path = self.find_cgroup_path(&cgroup_base, container_id, "blkio");
+        if let Some(ref path) = blkio_path {
+            if let Ok(blkio) = self.collect_blkio_stats(path) {
+                stats.blkio = Some(blkio);
+            }
         }
 
         // 采集PIDs统计
-        if let Ok(pids) = self.collect_pids_stats(cgroup_path) {
-            stats.pids = Some(pids);
+        let pids_path = self.find_cgroup_path(&cgroup_base, container_id, "pids");
+        if let Some(ref path) = pids_path {
+            if let Ok(pids) = self.collect_pids_stats(path) {
+                stats.pids = Some(pids);
+            }
         }
 
         debug!(
@@ -215,6 +234,60 @@ impl MetricsCollector {
         );
 
         Ok(stats)
+    }
+
+    /// 查找容器的cgroup路径
+    fn find_cgroup_path(&self, base: &Path, container_id: &str, subsystem: &str) -> Option<PathBuf> {
+        // 尝试直接路径: /sys/fs/cgroup/SUBSYSTEM/CONTAINER_ID
+        let direct_path = base.join(subsystem).join(container_id);
+        if direct_path.exists() {
+            return Some(direct_path);
+        }
+
+        // 递归查找所有子目录
+        let subsystem_path = base.join(subsystem);
+        if let Ok(entries) = fs::read_dir(&subsystem_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(found) = self.find_in_directory(&path, container_id) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// 递归在目录中查找容器cgroup
+    fn find_in_directory(&self, dir: &Path, container_id: &str) -> Option<PathBuf> {
+        // 检查当前目录是否匹配
+        let container_path = dir.join(container_id);
+        if container_path.exists() {
+            return Some(container_path);
+        }
+
+        // 递归查找子目录
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // 检查当前子目录是否匹配
+                    if let Some(file_name) = path.file_name() {
+                        if file_name == container_id {
+                            return Some(path);
+                        }
+                    }
+                    // 递归查找
+                    if let Some(found) = self.find_in_directory(&path, container_id) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// 采集CPU统计

@@ -1,3 +1,4 @@
+use log;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -45,6 +46,7 @@ use crate::runtime::{
     RuncRuntime, SeccompProfile, ShimConfig,
 };
 use crate::streaming::StreamingServer;
+use crate::metrics::MetricsCollector;
 
 /// 运行时服务实现
 #[derive(Debug)]
@@ -1053,6 +1055,38 @@ impl RuntimeServiceImpl {
 
         Ok(())
     }
+
+    /// 将内部 ContainerStats 转换为 proto 格式
+    fn convert_to_proto_container_stats(
+        stats: crate::metrics::ContainerStats,
+    ) -> crate::proto::runtime::v1::ContainerStats {
+        use crate::proto::runtime::v1::{ContainerStats, CpuUsage, MemoryUsage, UInt64Value};
+
+        ContainerStats {
+            attributes: Some(crate::proto::runtime::v1::ContainerAttributes {
+                id: stats.container_id.clone(),
+                metadata: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+            }),
+            cpu: stats.cpu.map(|cpu| CpuUsage {
+                timestamp: stats.timestamp as i64,
+                usage_core_nano_seconds: Some(UInt64Value { value: cpu.usage_total }),
+                usage_nano_cores: Some(UInt64Value { value: cpu.usage_user.saturating_add(cpu.usage_kernel) }),
+            }),
+            memory: stats.memory.map(|mem| MemoryUsage {
+                timestamp: stats.timestamp as i64,
+                working_set_bytes: Some(UInt64Value { value: mem.usage }),
+                available_bytes: Some(UInt64Value { value: mem.limit.saturating_sub(mem.usage) }),
+                usage_bytes: Some(UInt64Value { value: mem.usage }),
+                rss_bytes: Some(UInt64Value { value: mem.usage }), // 简化处理
+                page_faults: Some(UInt64Value { value: 0 }),
+                major_page_faults: Some(UInt64Value { value: 0 }),
+            }),
+            writable_layer: None,
+            swap: None,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -1691,8 +1725,12 @@ impl RuntimeService for RuntimeServiceImpl {
             return Err(Status::invalid_argument("cmd must not be empty"));
         }
 
-        let mut command =
-            TokioCommand::from(self.runtime.build_exec_command(&container_id, &cmd, false));
+        let mut command = TokioCommand::new("runc");
+        command.arg("exec");
+        command.arg(&container_id);
+        for arg in &cmd {
+            command.arg(arg);
+        }
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -2831,13 +2869,54 @@ impl RuntimeService for RuntimeServiceImpl {
         let req = request.into_inner();
         let container_id = req.container_id;
 
-        let containers = self.containers.lock().await;
-        let _container = containers
-            .get(&container_id)
-            .ok_or_else(|| Status::not_found("Container not found"))?;
+        log::info!("ContainerStats request for container: {}", container_id);
 
-        // TODO: 从cgroup读取实际统计信息
-        Ok(Response::new(ContainerStatsResponse { stats: None }))
+        let containers = self.containers.lock().await;
+        
+        log::debug!("Total containers in memory: {}", containers.len());
+        
+        let container = containers
+            .get(&container_id)
+            .ok_or_else(|| {
+                log::warn!("Container {} not found in memory", container_id);
+                Status::not_found("Container not found")
+            })?;
+        
+        log::info!("Found container {} in memory, collecting stats...", container_id);
+
+        // 从容器注解中读取 cgroup_parent
+        let container_state = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        );
+
+        let cgroup_parent = container_state
+            .as_ref()
+            .and_then(|s| s.cgroup_parent.as_ref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+
+        // 创建指标采集器并收集容器统计信息
+        let stats = match MetricsCollector::new() {
+            Ok(collector) => {
+                match collector.collect_container_stats(&container_id, &cgroup_parent) {
+                    Ok(stats) => {
+                        // 转换为 proto 格式
+                        Some(Self::convert_to_proto_container_stats(stats))
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to collect stats for container {}: {}", container_id, e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to create MetricsCollector: {}", e);
+                None
+            }
+        };
+
+        Ok(Response::new(ContainerStatsResponse { stats }))
     }
 
     // 容器列表统计信息
@@ -2845,10 +2924,42 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<ListContainerStatsRequest>,
     ) -> Result<Response<ListContainerStatsResponse>, Status> {
-        // TODO: 实现完整的统计列表
-        Ok(Response::new(ListContainerStatsResponse {
-            stats: Vec::new(),
-        }))
+        let containers = self.containers.lock().await;
+        let mut all_stats = Vec::new();
+
+        // 创建指标采集器
+        let collector = match MetricsCollector::new() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to create MetricsCollector: {}", e);
+                return Ok(Response::new(ListContainerStatsResponse {
+                    stats: Vec::new(),
+                }));
+            }
+        };
+
+        // 为每个容器收集统计信息
+        for (container_id, container) in containers.iter() {
+            // 从容器注解中读取 cgroup_parent
+            let container_state = Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            );
+
+            let cgroup_parent = container_state
+                .as_ref()
+                .and_then(|s| s.cgroup_parent.as_ref())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+
+            // 收集容器统计信息
+            if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
+                let proto_stats = Self::convert_to_proto_container_stats(stats);
+                all_stats.push(proto_stats);
+            }
+        }
+
+        Ok(Response::new(ListContainerStatsResponse { stats: all_stats }))
     }
 
     // pod沙箱统计信息
