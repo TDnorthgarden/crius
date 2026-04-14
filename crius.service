@@ -3,6 +3,7 @@ Description=CRIUS Container Runtime
 After=network.target dbus.service
 
 [Service]
+Environment="CRIUS_SHIM_PATH=/usr/bin/crius-shim"
 Environment="CRIUS_CNI_CONFIG_DIRS=/etc/cni/net.d"
 Environment="CRIUS_CNI_PLUGIN_DIRS=/usr/libexec/cni"
 Environment="CRIUS_PAUSE_IMAGE=registry.k8s.io/pause:3.9"
