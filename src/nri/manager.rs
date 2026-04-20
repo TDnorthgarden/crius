@@ -17,8 +17,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::nri::{
-    multiplex_connection, NopNri, NriApi, NriContainerEvent, NriDomain, NriError, NriManagerConfig,
-    NriPodEvent, PluginTtrpcClient, Result, RuntimeTtrpcServer,
+    merge_container_adjustments, multiplex_connection, NopNri, NriApi, NriContainerEvent,
+    NriCreateContainerResult, NriDomain, NriError, NriManagerConfig, NriPodEvent,
+    PluginTtrpcClient, Result, RuntimeTtrpcServer,
 };
 use crate::nri_proto::api as nri_api;
 
@@ -61,6 +62,14 @@ trait PluginRpc: Send + Sync {
         &self,
         req: &nri_api::StopContainerRequest,
     ) -> Result<nri_api::StopContainerResponse>;
+    async fn update_pod_sandbox(
+        &self,
+        req: &nri_api::UpdatePodSandboxRequest,
+    ) -> Result<nri_api::UpdatePodSandboxResponse>;
+    async fn validate_container_adjustment(
+        &self,
+        req: &nri_api::ValidateContainerAdjustmentRequest,
+    ) -> Result<nri_api::ValidateContainerAdjustmentResponse>;
     async fn state_change(&self, req: &nri_api::StateChangeEvent) -> Result<nri_api::Empty>;
     async fn shutdown(&self) -> Result<()>;
 }
@@ -102,6 +111,20 @@ impl PluginRpc for PluginTtrpcClient {
         self.stop_container(req).await
     }
 
+    async fn update_pod_sandbox(
+        &self,
+        req: &nri_api::UpdatePodSandboxRequest,
+    ) -> Result<nri_api::UpdatePodSandboxResponse> {
+        self.update_pod_sandbox(req).await
+    }
+
+    async fn validate_container_adjustment(
+        &self,
+        req: &nri_api::ValidateContainerAdjustmentRequest,
+    ) -> Result<nri_api::ValidateContainerAdjustmentResponse> {
+        self.validate_container_adjustment(req).await
+    }
+
     async fn state_change(&self, req: &nri_api::StateChangeEvent) -> Result<nri_api::Empty> {
         self.state_change(req).await
     }
@@ -136,6 +159,7 @@ struct ManagerRuntimeHandler {
     registration_notify: Arc<Notify>,
     client: Option<Arc<dyn PluginRpc>>,
     config: String,
+    plugin_config_path: PathBuf,
     expected_plugin: Option<(String, String)>,
     registered_tx: Arc<Mutex<Option<oneshot::Sender<(String, String)>>>>,
 }
@@ -166,7 +190,12 @@ impl crate::nri::transport::RuntimeServiceHandler for ManagerRuntimeHandler {
                 index: plugin_idx.clone(),
                 events_mask: 0,
                 socket_path: String::new(),
-                config: self.config.clone(),
+                config: if self.config.is_empty() {
+                    load_plugin_config(&self.plugin_config_path, &plugin_idx, &plugin_name)
+                        .map_err(io_to_plugin_error)?
+                } else {
+                    self.config.clone()
+                },
             },
             true,
             self.client.clone(),
@@ -225,6 +254,7 @@ impl NriManager {
             registration_notify: registration_notify.clone(),
             client: None,
             config: String::new(),
+            plugin_config_path: PathBuf::from(&config.plugin_config_path),
             expected_plugin: None,
             registered_tx: Arc::new(Mutex::new(None)),
         });
@@ -394,14 +424,24 @@ impl NriManager {
         Ok(())
     }
 
-    async fn dispatch_create_container(&self, event_payload: &NriContainerEvent) -> Result<()> {
+    async fn dispatch_create_container(
+        &self,
+        event_payload: &NriContainerEvent,
+    ) -> Result<NriCreateContainerResult> {
         let _sync_guard = self.plugin_sync_gate.read().await;
         let plugins = self
             .plugins_for_event(nri_api::Event::CREATE_CONTAINER)
             .await;
+        let mut plugin_adjustments = Vec::new();
+        let mut updates = Vec::new();
+        let mut evictions = Vec::new();
+        let mut consulted_plugins = Vec::new();
         for plugin in plugins {
             let mut req = nri_api::CreateContainerRequest::new();
-            req.container = MessageField::some(container_from_event(event_payload));
+            if let Some(pod) = event_payload.pod.as_ref() {
+                req.pod = MessageField::some(pod.clone());
+            }
+            req.container = MessageField::some(event_payload.container.clone());
             let result = self
                 .call_with_timeout(plugin.client.create_container(&req))
                 .await;
@@ -413,7 +453,81 @@ impl NriManager {
                 }
                 return Err(err);
             }
+            let response = result.expect("successful create response");
+            consulted_plugins.push(plugin_instance(&plugin.record));
+            plugin_adjustments.push((
+                plugin_adjustment_owner(&plugin.record),
+                response
+                    .adjust
+                    .clone()
+                    .into_option()
+                    .unwrap_or_else(nri_api::ContainerAdjustment::new),
+            ));
+            updates.extend(response.update);
+            evictions.extend(response.evict);
         }
+        let merged = merge_container_adjustments(&event_payload.container.id, &plugin_adjustments)?;
+        self.validate_create_container_result(event_payload, &merged, &updates, &consulted_plugins)
+            .await?;
+        Ok(NriCreateContainerResult {
+            adjustment: merged.adjustment,
+            updates,
+            evictions,
+        })
+    }
+
+    async fn validate_create_container_result(
+        &self,
+        event_payload: &NriContainerEvent,
+        merged: &crate::nri::MergeResult,
+        updates: &[nri_api::ContainerUpdate],
+        consulted_plugins: &[nri_api::PluginInstance],
+    ) -> Result<()> {
+        let validators = self
+            .plugins_for_event(nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT)
+            .await;
+        if validators.is_empty() {
+            return Ok(());
+        }
+
+        let mut req = nri_api::ValidateContainerAdjustmentRequest::new();
+        if let Some(pod) = event_payload.pod.as_ref() {
+            req.pod = MessageField::some(pod.clone());
+        }
+        req.container = MessageField::some(event_payload.container.clone());
+        req.adjust = MessageField::some(merged.adjustment.clone());
+        req.update = updates.to_vec();
+        req.owners = MessageField::some(merged.owners.clone());
+        req.plugins = consulted_plugins.to_vec();
+
+        for plugin in validators {
+            let result = self
+                .call_with_timeout(plugin.client.validate_container_adjustment(&req))
+                .await;
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => {
+                    if should_cleanup_plugin(&err) {
+                        self.unregister_plugin(&plugin.record.name, &plugin.record.index)
+                            .await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            if response.reject {
+                let reason = if response.reason.is_empty() {
+                    format!(
+                        "validator {} rejected container adjustment",
+                        plugin_adjustment_owner(&plugin.record)
+                    )
+                } else {
+                    response.reason
+                };
+                return Err(NriError::Plugin(reason));
+            }
+        }
+
         Ok(())
     }
 
@@ -424,7 +538,10 @@ impl NriManager {
             .await;
         for plugin in plugins {
             let mut req = nri_api::UpdateContainerRequest::new();
-            req.container = MessageField::some(container_from_event(event_payload));
+            if let Some(pod) = event_payload.pod.as_ref() {
+                req.pod = MessageField::some(pod.clone());
+            }
+            req.container = MessageField::some(event_payload.container.clone());
             let result = self
                 .call_with_timeout(plugin.client.update_container(&req))
                 .await;
@@ -445,9 +562,43 @@ impl NriManager {
         let plugins = self.plugins_for_event(nri_api::Event::STOP_CONTAINER).await;
         for plugin in plugins {
             let mut req = nri_api::StopContainerRequest::new();
-            req.container = MessageField::some(container_from_event(event_payload));
+            if let Some(pod) = event_payload.pod.as_ref() {
+                req.pod = MessageField::some(pod.clone());
+            }
+            req.container = MessageField::some(event_payload.container.clone());
             let result = self
                 .call_with_timeout(plugin.client.stop_container(&req))
+                .await;
+            if let Err(err) = result {
+                if should_cleanup_plugin(&err) {
+                    self.unregister_plugin(&plugin.record.name, &plugin.record.index)
+                        .await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    async fn dispatch_update_pod_sandbox(&self, event_payload: &NriPodEvent) -> Result<()> {
+        let _sync_guard = self.plugin_sync_gate.read().await;
+        let plugins = self
+            .plugins_for_event(nri_api::Event::UPDATE_POD_SANDBOX)
+            .await;
+        for plugin in plugins {
+            let mut req = nri_api::UpdatePodSandboxRequest::new();
+            if let Some(pod) = event_payload.pod.as_ref() {
+                req.pod = MessageField::some(pod.clone());
+            }
+            if let Some(overhead) = event_payload.overhead_linux_resources.as_ref() {
+                req.overhead_linux_resources = MessageField::some(overhead.clone());
+            }
+            if let Some(resources) = event_payload.linux_resources.as_ref() {
+                req.linux_resources = MessageField::some(resources.clone());
+            }
+            let result = self
+                .call_with_timeout(plugin.client.update_pod_sandbox(&req))
                 .await;
             if let Err(err) = result {
                 if should_cleanup_plugin(&err) {
@@ -579,6 +730,7 @@ impl NriManager {
                 .as_ref()
                 .map(|plugin| plugin.config.clone())
                 .unwrap_or_default(),
+            plugin_config_path: PathBuf::from(&self.config.plugin_config_path),
             expected_plugin: expected_plugin
                 .as_ref()
                 .map(|plugin| (plugin.name.clone(), plugin.index.clone())),
@@ -750,6 +902,21 @@ struct DispatchPlugin {
     client: Arc<dyn PluginRpc>,
 }
 
+fn plugin_instance(record: &PluginRecord) -> nri_api::PluginInstance {
+    let mut plugin = nri_api::PluginInstance::new();
+    plugin.name = record.name.clone();
+    plugin.index = record.index.clone();
+    plugin
+}
+
+fn plugin_adjustment_owner(record: &PluginRecord) -> String {
+    if record.index.is_empty() {
+        record.name.clone()
+    } else {
+        format!("{}-{}", record.index, record.name)
+    }
+}
+
 pub struct PluginSyncBlock {
     guard: Option<OwnedRwLockReadGuard<()>>,
 }
@@ -830,11 +997,9 @@ fn build_state_change_event(
     let mut req = nri_api::StateChangeEvent::new();
     req.event = event.into();
     if let Some(event_payload) = event_payload {
-        req.container = MessageField::some(container_from_event(event_payload));
-        if !event_payload.pod_id.is_empty() {
-            let mut pod = nri_api::PodSandbox::new();
-            pod.id = event_payload.pod_id.clone();
-            req.pod = MessageField::some(pod);
+        req.container = MessageField::some(event_payload.container.clone());
+        if let Some(pod) = event_payload.pod.as_ref() {
+            req.pod = MessageField::some(pod.clone());
         }
     }
     req
@@ -846,20 +1011,10 @@ fn build_state_change_event_for_pod(
 ) -> nri_api::StateChangeEvent {
     let mut req = nri_api::StateChangeEvent::new();
     req.event = event.into();
-    if !event_payload.pod_id.is_empty() {
-        let mut pod = nri_api::PodSandbox::new();
-        pod.id = event_payload.pod_id.clone();
-        req.pod = MessageField::some(pod);
+    if let Some(pod) = event_payload.pod.as_ref() {
+        req.pod = MessageField::some(pod.clone());
     }
     req
-}
-
-fn container_from_event(event: &NriContainerEvent) -> nri_api::Container {
-    let mut container = nri_api::Container::new();
-    container.id = event.container_id.clone();
-    container.pod_sandbox_id = event.pod_id.clone();
-    container.annotations = event.annotations.clone();
-    container
 }
 
 fn should_cleanup_plugin(err: &NriError) -> bool {
@@ -980,8 +1135,7 @@ impl NriApi for NriManager {
         }
         self.start_external_listener().await?;
         let plugins = self.discover_preinstalled_plugins()?;
-        self.launch_preinstalled_plugins(&plugins).await?;
-        self.synchronize().await
+        self.launch_preinstalled_plugins(&plugins).await
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1020,8 +1174,11 @@ impl NriApi for NriManager {
             return Ok(());
         }
         let _sync_gate = self.plugin_sync_gate.write().await;
+        let snapshot = self.domain.snapshot().await?;
         let plugins = self.plugins_for_synchronize().await;
         let mut sync_req = nri_api::SynchronizeRequest::new();
+        sync_req.pods = snapshot.pods;
+        sync_req.containers = snapshot.containers;
         sync_req.more = false;
         for plugin in plugins {
             let result = self
@@ -1056,7 +1213,14 @@ impl NriApi for NriManager {
             .await
     }
 
-    async fn create_container(&self, event: NriContainerEvent) -> Result<()> {
+    async fn update_pod_sandbox(&self, event: NriPodEvent) -> Result<()> {
+        self.dispatch_update_pod_sandbox(&event).await
+    }
+
+    async fn create_container(
+        &self,
+        event: NriContainerEvent,
+    ) -> Result<NriCreateContainerResult> {
         self.dispatch_create_container(&event).await
     }
 
@@ -1115,6 +1279,7 @@ mod tests {
         synchronize_delay: Option<Duration>,
         state_change_delay: Option<Duration>,
         shutdown_calls: AtomicUsize,
+        create_response: Option<nri_api::CreateContainerResponse>,
     }
 
     #[derive(Default)]
@@ -1125,8 +1290,8 @@ mod tests {
 
     #[async_trait]
     impl NriDomain for FakeDomain {
-        async fn snapshot(&self) -> Result<()> {
-            Ok(())
+        async fn snapshot(&self) -> Result<crate::nri::domain::RuntimeSnapshot> {
+            Ok(crate::nri::domain::RuntimeSnapshot::default())
         }
 
         async fn apply_updates(
@@ -1176,7 +1341,10 @@ mod tests {
             _req: &nri_api::CreateContainerRequest,
         ) -> Result<nri_api::CreateContainerResponse> {
             self.calls.lock().await.push("create".to_string());
-            Ok(nri_api::CreateContainerResponse::new())
+            Ok(self
+                .create_response
+                .clone()
+                .unwrap_or_else(nri_api::CreateContainerResponse::new))
         }
 
         async fn update_container(
@@ -1193,6 +1361,22 @@ mod tests {
         ) -> Result<nri_api::StopContainerResponse> {
             self.calls.lock().await.push("stop".to_string());
             Ok(nri_api::StopContainerResponse::new())
+        }
+
+        async fn update_pod_sandbox(
+            &self,
+            _req: &nri_api::UpdatePodSandboxRequest,
+        ) -> Result<nri_api::UpdatePodSandboxResponse> {
+            self.calls.lock().await.push("update_pod".to_string());
+            Ok(nri_api::UpdatePodSandboxResponse::new())
+        }
+
+        async fn validate_container_adjustment(
+            &self,
+            _req: &nri_api::ValidateContainerAdjustmentRequest,
+        ) -> Result<nri_api::ValidateContainerAdjustmentResponse> {
+            self.calls.lock().await.push("validate".to_string());
+            Ok(nri_api::ValidateContainerAdjustmentResponse::new())
         }
 
         async fn state_change(&self, req: &nri_api::StateChangeEvent) -> Result<nri_api::Empty> {
@@ -1264,6 +1448,21 @@ mod tests {
         );
     }
 
+    fn test_container_event() -> NriContainerEvent {
+        let mut pod = nri_api::PodSandbox::new();
+        pod.id = "pod-1".to_string();
+
+        let mut container = nri_api::Container::new();
+        container.id = "ctr-1".to_string();
+        container.pod_sandbox_id = "pod-1".to_string();
+        container.annotations = HashMap::new();
+
+        NriContainerEvent {
+            pod: Some(pod),
+            container,
+        }
+    }
+
     #[tokio::test]
     async fn plugins_are_sorted_by_index_then_name() {
         let manager = manager_for_tests();
@@ -1333,11 +1532,7 @@ mod tests {
             .expect("synchronize should activate subscribed plugin");
 
         manager
-            .create_container(NriContainerEvent {
-                pod_id: "pod-1".to_string(),
-                container_id: "ctr-1".to_string(),
-                annotations: HashMap::new(),
-            })
+            .create_container(test_container_event())
             .await
             .expect("dispatch should succeed");
 
@@ -1380,11 +1575,7 @@ mod tests {
         insert_plugin_for_test(&manager, "late", "1", create_bit, true, plugin.clone()).await;
 
         manager
-            .create_container(NriContainerEvent {
-                pod_id: "pod-1".to_string(),
-                container_id: "ctr-1".to_string(),
-                annotations: HashMap::new(),
-            })
+            .create_container(test_container_event())
             .await
             .expect("unsynchronized plugin should be skipped");
         assert!(plugin.calls.lock().await.is_empty());
@@ -1394,16 +1585,94 @@ mod tests {
             .await
             .expect("synchronize should activate plugin");
         manager
-            .create_container(NriContainerEvent {
-                pod_id: "pod-1".to_string(),
-                container_id: "ctr-1".to_string(),
-                annotations: HashMap::new(),
-            })
+            .create_container(test_container_event())
             .await
             .expect("synchronized plugin should receive lifecycle event");
 
         let calls = plugin.calls.lock().await.clone();
         assert_eq!(calls, vec!["synchronize", "create"]);
+    }
+
+    #[tokio::test]
+    async fn update_pod_sandbox_targets_subscribed_plugins() {
+        let manager = manager_for_tests();
+        let subscribed = Arc::new(FakePluginClient::default());
+        let unsubscribed = Arc::new(FakePluginClient::default());
+        let event_bit = 1_i32 << (nri_api::Event::UPDATE_POD_SANDBOX as u32);
+
+        insert_plugin_for_test(&manager, "subscribed", "01", event_bit, true, subscribed.clone())
+            .await;
+        insert_plugin_for_test(&manager, "unsubscribed", "02", 0, true, unsubscribed.clone())
+            .await;
+        manager
+            .synchronize()
+            .await
+            .expect("synchronize should activate subscribed plugin");
+
+        manager
+            .update_pod_sandbox(NriPodEvent::default())
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(
+            subscribed.calls.lock().await.clone(),
+            vec!["synchronize", "update_pod"]
+        );
+        assert_eq!(unsubscribed.calls.lock().await.clone(), vec!["synchronize"]);
+    }
+
+    #[tokio::test]
+    async fn create_container_merges_plugin_responses_and_validates() {
+        let manager = manager_for_tests();
+        let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
+        let validate_bit = 1_i32 << (nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT as u32);
+
+        let mut first_response = nri_api::CreateContainerResponse::new();
+        let mut first_adjust = nri_api::ContainerAdjustment::new();
+        first_adjust.annotations.insert("a".to_string(), "1".to_string());
+        first_response.adjust = MessageField::some(first_adjust);
+        first_response.update.push(nri_api::ContainerUpdate {
+            container_id: "u1".to_string(),
+            ..Default::default()
+        });
+        let first = Arc::new(FakePluginClient {
+            create_response: Some(first_response),
+            ..Default::default()
+        });
+
+        let mut second_response = nri_api::CreateContainerResponse::new();
+        let mut second_adjust = nri_api::ContainerAdjustment::new();
+        second_adjust.args = vec![String::new(), "/bin/echo".to_string()];
+        second_response.adjust = MessageField::some(second_adjust);
+        second_response.evict.push(nri_api::ContainerEviction {
+            container_id: "e1".to_string(),
+            reason: "test".to_string(),
+            ..Default::default()
+        });
+        let second = Arc::new(FakePluginClient {
+            create_response: Some(second_response),
+            ..Default::default()
+        });
+        let validator = Arc::new(FakePluginClient::default());
+
+        insert_plugin_for_test(&manager, "p1", "01", create_bit, true, first.clone()).await;
+        insert_plugin_for_test(&manager, "p2", "02", create_bit, true, second.clone()).await;
+        insert_plugin_for_test(&manager, "validator", "03", validate_bit, true, validator.clone())
+            .await;
+        manager.synchronize().await.unwrap();
+
+        let result = manager.create_container(test_container_event()).await.unwrap();
+
+        assert_eq!(result.adjustment.annotations.get("a"), Some(&"1".to_string()));
+        assert_eq!(result.adjustment.args, vec!["/bin/echo".to_string()]);
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.evictions.len(), 1);
+        assert_eq!(first.calls.lock().await.clone(), vec!["synchronize", "create"]);
+        assert_eq!(second.calls.lock().await.clone(), vec!["synchronize", "create"]);
+        assert_eq!(
+            validator.calls.lock().await.clone(),
+            vec!["synchronize", "validate"]
+        );
     }
 
     #[tokio::test]
@@ -1439,11 +1708,7 @@ mod tests {
             .expect("synchronize should succeed");
 
         manager
-            .create_container(NriContainerEvent {
-                pod_id: "pod-1".to_string(),
-                container_id: "ctr-1".to_string(),
-                annotations: HashMap::new(),
-            })
+            .create_container(test_container_event())
             .await
             .expect("plugin should be active after sync completes");
         let calls = plugin.calls.lock().await.clone();
@@ -1500,6 +1765,7 @@ mod tests {
             registration_notify: Arc::new(Notify::new()),
             client: None,
             config: String::new(),
+            plugin_config_path: PathBuf::new(),
             expected_plugin: None,
             registered_tx: Arc::new(Mutex::new(None)),
         };
@@ -1538,6 +1804,38 @@ mod tests {
 
         assert_eq!(plugin.shutdown_calls.load(AtomicOrdering::SeqCst), 1);
         assert!(manager.registered_plugins().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_registration_loads_plugin_specific_config() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join("conf.d");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("03-external.conf"), "external-config").unwrap();
+
+        let state = Arc::new(RwLock::new(ManagerState::default()));
+        let handler = ManagerRuntimeHandler {
+            state: state.clone(),
+            domain: Arc::new(NopNri),
+            registration_notify: Arc::new(Notify::new()),
+            client: None,
+            config: String::new(),
+            plugin_config_path: config_dir,
+            expected_plugin: None,
+            registered_tx: Arc::new(Mutex::new(None)),
+        };
+        let mut req = nri_api::RegisterPluginRequest::new();
+        req.plugin_name = "external".to_string();
+        req.plugin_idx = "03".to_string();
+
+        handler
+            .register_plugin(req)
+            .await
+            .expect("registration should load plugin config");
+
+        let plugins = state.read().await;
+        assert_eq!(plugins.plugins.len(), 1);
+        assert_eq!(plugins.plugins[0].record.config, "external-config");
     }
 
     #[test]

@@ -1,24 +1,32 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
 
+use crate::nri::domain::RuntimeSnapshot;
 use crate::nri::error::Result;
 use crate::nri_proto::api as nri_api;
 
 #[derive(Debug, Clone, Default)]
 pub struct NriPodEvent {
-    pub pod_id: String,
+    pub pod: Option<nri_api::PodSandbox>,
+    pub overhead_linux_resources: Option<nri_api::LinuxResources>,
+    pub linux_resources: Option<nri_api::LinuxResources>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct NriContainerEvent {
-    pub pod_id: String,
-    pub container_id: String,
-    pub annotations: HashMap<String, String>,
+    pub pod: Option<nri_api::PodSandbox>,
+    pub container: nri_api::Container,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NriCreateContainerResult {
+    pub adjustment: nri_api::ContainerAdjustment,
+    pub updates: Vec<nri_api::ContainerUpdate>,
+    pub evictions: Vec<nri_api::ContainerEviction>,
 }
 
 #[async_trait]
 pub trait NriDomain: Send + Sync {
-    async fn snapshot(&self) -> Result<()>;
+    async fn snapshot(&self) -> Result<RuntimeSnapshot>;
     async fn apply_updates(
         &self,
         _updates: &[nri_api::ContainerUpdate],
@@ -40,8 +48,14 @@ pub trait NriApi: Send + Sync {
     async fn remove_pod_sandbox(&self, _event: NriPodEvent) -> Result<()> {
         Ok(())
     }
-    async fn create_container(&self, _event: NriContainerEvent) -> Result<()> {
+    async fn update_pod_sandbox(&self, _event: NriPodEvent) -> Result<()> {
         Ok(())
+    }
+    async fn create_container(
+        &self,
+        _event: NriContainerEvent,
+    ) -> Result<NriCreateContainerResult> {
+        Ok(NriCreateContainerResult::default())
     }
     async fn post_create_container(&self, _event: NriContainerEvent) -> Result<()> {
         Ok(())
@@ -86,8 +100,8 @@ impl NriApi for NopNri {
 
 #[async_trait]
 impl NriDomain for NopNri {
-    async fn snapshot(&self) -> Result<()> {
-        Ok(())
+    async fn snapshot(&self) -> Result<RuntimeSnapshot> {
+        Ok(RuntimeSnapshot::default())
     }
 
     async fn apply_updates(
@@ -104,7 +118,7 @@ impl NriDomain for NopNri {
 
 #[cfg(test)]
 mod tests {
-    use super::{NopNri, NriApi, NriContainerEvent, NriDomain, NriPodEvent};
+    use super::{NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriPodEvent};
 
     #[tokio::test]
     async fn nop_nri_api_methods_are_noop() {
@@ -114,9 +128,11 @@ mod tests {
         nop.run_pod_sandbox(NriPodEvent::default())
             .await
             .expect("run pod should be noop");
-        nop.create_container(NriContainerEvent::default())
+        let create = nop
+            .create_container(NriContainerEvent::default())
             .await
             .expect("create container should be noop");
+        assert!(matches!(create, NriCreateContainerResult { .. }));
         nop.post_create_container(NriContainerEvent::default())
             .await
             .expect("post create should be noop");
@@ -126,7 +142,9 @@ mod tests {
     #[tokio::test]
     async fn nop_nri_domain_methods_are_noop() {
         let nop = NopNri;
-        nop.snapshot().await.expect("snapshot should be noop");
+        let snapshot = nop.snapshot().await.expect("snapshot should be noop");
+        assert!(snapshot.pods.is_empty());
+        assert!(snapshot.containers.is_empty());
         let failed = nop
             .apply_updates(&[])
             .await
