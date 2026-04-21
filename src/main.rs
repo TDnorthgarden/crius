@@ -106,14 +106,7 @@ async fn main() -> Result<(), Error> {
         .set_streaming_server(streaming_server.clone())
         .await;
 
-    // 从持久化存储恢复状态
-    info!("Recovering state from database...");
-    if let Err(e) = runtime_service.recover_state().await {
-        log::error!("Failed to recover state: {}", e);
-    }
-    if let Err(e) = runtime_service.initialize_nri().await {
-        log::error!("Failed to initialize NRI: {}", e);
-    }
+    prepare_runtime_service(&runtime_service).await;
     let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(include_bytes!(concat!(
@@ -169,6 +162,16 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+async fn prepare_runtime_service(runtime_service: &RuntimeServiceImpl) {
+    info!("Recovering state from database...");
+    if let Err(e) = runtime_service.recover_state().await {
+        log::error!("Failed to recover state: {}", e);
+    }
+    if let Err(e) = runtime_service.initialize_nri().await {
+        log::error!("Failed to initialize NRI: {}", e);
+    }
+}
+
 fn init_logging() -> Result<(), Error> {
     let filter = EnvFilter::from_default_env()
         .add_directive("crius=info".parse()?)
@@ -201,7 +204,52 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalLogTimer {
 #[cfg(test)]
 mod tests {
     use super::LocalLogTimer;
+    use super::prepare_runtime_service;
+    use super::RuntimeConfig;
     use tracing_subscriber::fmt::time::FormatTime;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
+    use crius::config::NriConfig;
+    use crius::network::CniConfig;
+    use crius::nri::NriApi;
+    use crius::server::RuntimeServiceImpl;
+
+    #[derive(Default)]
+    struct FakeNri {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NriApi for FakeNri {
+        async fn start(&self) -> crius::nri::Result<()> {
+            self.calls.lock().await.push("start");
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> crius::nri::Result<()> {
+            Ok(())
+        }
+
+        async fn synchronize(&self) -> crius::nri::Result<()> {
+            self.calls.lock().await.push("synchronize");
+            Ok(())
+        }
+    }
+
+    fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
+        RuntimeConfig {
+            root_dir,
+            runtime: "runc".to_string(),
+            runtime_handlers: vec!["runc".to_string()],
+            runtime_root: PathBuf::from("/tmp/crius-main-test-runtime-root"),
+            log_dir: PathBuf::from("/tmp/crius-main-test-logs"),
+            runtime_path: PathBuf::from("/definitely/missing/runc"),
+            pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            cni_config: CniConfig::default(),
+        }
+    }
 
     #[test]
     fn local_log_time_uses_rfc3339_local_timestamp() {
@@ -217,6 +265,25 @@ mod tests {
         assert_eq!(
             parsed.offset().local_minus_utc(),
             chrono::Local::now().offset().local_minus_utc()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_runtime_service_recovers_then_initializes_nri_before_serve() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let mut nri_config = NriConfig::default();
+        nri_config.enable = true;
+        let service = RuntimeServiceImpl::new_with_nri_api(
+            test_runtime_config(tempdir().unwrap().keep()),
+            nri_config,
+            fake_nri.clone(),
+        );
+
+        prepare_runtime_service(&service).await;
+
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec!["start", "synchronize"]
         );
     }
 }

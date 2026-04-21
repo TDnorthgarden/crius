@@ -1,8 +1,7 @@
-use std::collections::HashMap;
+use crate::nri_proto::api as nri_api;
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeSnapshot {
-    pub pods: Vec<String>,
-    pub containers: Vec<String>,
-    pub annotations: HashMap<String, HashMap<String, String>>,
+    pub pods: Vec<nri_api::PodSandbox>,
+    pub containers: Vec<nri_api::Container>,
 }
